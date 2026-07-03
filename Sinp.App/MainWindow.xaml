@@ -3,11 +3,15 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Sinp - 截图OCR"
         Height="560" Width="420"
+        WindowStartupLocation="CenterScreen"
+        WindowState="Normal"
         WindowStyle="None"
         AllowsTransparency="True"
-        Background="Transparent"
+        Background="#1E1E2E"
         ResizeMode="CanResizeWithGrip"
         ShowInTaskbar="True"
+        ShowActivated="True"
+        Visibility="Visible"
         Topmost="True"
         Loaded="Window_Loaded">
 

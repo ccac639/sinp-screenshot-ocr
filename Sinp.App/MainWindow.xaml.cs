@@ -28,6 +28,13 @@ namespace Sinp.App
         public MainWindow()
         {
             InitializeComponent();
+
+            // 重置窗口位置（避免在屏幕外）
+            this.WindowStartupLocation = WindowStartupLocation.CenterScreen;
+            this.Left = 100;
+            this.Top = 100;
+            this.Width = 420;
+            this.Height = 560;
         }
 
         private void Window_Loaded(object sender, RoutedEventArgs e)
@@ -47,11 +54,27 @@ namespace Sinp.App
             if (_hwndSource != null)
                 _hwndSource.AddHook(WndProcHook);
 
-            // 初始化系统托盘图标
-            InitTrayIcon();
+            // 确保窗口显示在最前面
+            this.Topmost = true;
+            this.Show();
+            this.Activate();
+            this.Focus();
+
+            // 延迟取消 Topmost（1 秒后）
+            var timer = new System.Windows.Threading.DispatcherTimer();
+            timer.Interval = TimeSpan.FromSeconds(1);
+            timer.Tick += (s, ev) =>
+            {
+                this.Topmost = false;
+                timer.Stop();
+            };
+            timer.Start();
+
+            // 初始化系统托盘图标（暂时禁用以排查启动问题）
+            // InitTrayIcon();
 
             // 处理窗口关闭事件（最小化到托盘而不是直接退出）
-            this.Closing += MainWindow_Closing;
+            // this.Closing += MainWindow_Closing;
 
             StatusText.Text = "就绪 | Ctrl+Shift+S 截图 | ESC 取消";
             Logger.Info("主窗口加载完成，热键系统就绪");
@@ -352,18 +375,8 @@ namespace Sinp.App
                 }
                 else
                 {
-                    // 显示更友好的错误信息
-                    var errorMsg = resp.ErrorMessage ?? "未知错误";
-                    if (errorMsg.Contains("Worker 未运行"))
-                    {
-                        StatusText.Text = "OCR Worker 未启动，请检查 Python 环境";
-                        Logger.Error("OCR 失败: Python Worker 未运行");
-                    }
-                    else
-                    {
-                        StatusText.Text = string.Format("OCR 失败: {0}", errorMsg);
-                        Logger.Error(string.Format("OCR 失败: {0}", errorMsg));
-                    }
+                    StatusText.Text = string.Format("OCR 失败: {0}", resp.ErrorMessage);
+                    Logger.Error(string.Format("OCR 失败: {0}", resp.ErrorMessage));
                 }
             }
             catch (Exception ex)

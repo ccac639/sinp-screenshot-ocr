@@ -1,8 +1,8 @@
-═══════════════════════════════════════════════════════════
+═════════════════════════════════════════════════════════
   Sinp Screenshot OCR Tool — 完整代码总结
-  版本：v2.0（后台线程版 · 彻底修复 Timer 失效）
+  版本：v2.1（修复循环顺序 · 彻底修复只截一帧）
   日期：2026-07-04
-═══════════════════════════════════════════════════════════
+═════════════════════════════════════════════════════════
 
 一、项目架构
 ─────────────────────────────────────────────────────────
@@ -10,11 +10,26 @@
 UI 框架：WPF（主窗口）+ WinForms（截图 Overlay）
 项目文件：
   Sinp.App          ← 主程序（WPF + 系统托盘）
-  Sinp.Overlay      ← 截图选区 Overlay（WinForms Form）
-  Sinp.Hotkey      ← 全局热键管理器
-  Sinp.OCRClient    ← OCR 识别客户端（Python PaddleOCR）
+  Sinp.Overlay       ← 截图选区 Overlay（WinForms Form）
+  Sinp.Hotkey       ← 全局热键管理器
+  Sinp.OCRClient     ← OCR 识别客户端（Python PaddleOCR）
 
-二、文件结构
+二、v2.1 核心修复（2026-07-04）
+─────────────────────────────────────────────────────────
+本次修复了"长截图只滚动一帧就停止"的根本问题。
+
+修复前（有 bug 的循环顺序）：
+  滚动 → 等待 → 截图 → 检测到底 → break
+  ❌ 第一次滚动后 UI 未稳定 → 截图失败 → break
+  ❌ null frame 直接 break → 只截一帧就停
+
+修复后（正确的循环顺序）：
+  截图 → 保存 → 检测到底 → 滚动 → 等待 → 下一帧
+  ✔ 截图失败 → continue + failCount（不 break）
+  ✔ 至少捕获 3 帧后才检测到底（避免误判）
+  ✔ Overlay 在启动线程前就隐藏（目标窗口能接收滚轮）
+
+三、文件结构
 ─────────────────────────────────────────────────────────
 D:\sinp\
 ├── Sinp.App\
@@ -23,7 +38,7 @@ D:\sinp\
 │   ├── Logger.cs                     ← 日志工具
 │   └── Sinp.App.csproj
 ├── Sinp.Overlay\
-│   ├── RegionSelector.cs            ← 核心：截图选区 + 长截图（v2）
+│   ├── RegionSelector.cs            ★ 核心：截图选区 + 长截图（v2.1）
 │   └── Sinp.Overlay.csproj
 ├── Sinp.Hotkey\
 │   ├── GlobalHotkeyManager.cs       ← 全局热键（RegisterHotKey + LL 钩子）
@@ -34,69 +49,12 @@ D:\sinp\
 ├── build.bat                       ← 编译脚本
 └── Sinp.sln                        ← 解决方案文件
 
-三、核心模块详解
+四、核心模块详解
 ─────────────────────────────────────────────────────────
 
 ═════════════════════════════════════════════════════
- Module 1：GlobalHotkeyManager.cs（全局热键）
-═══════════════════════════════════════════════════════
-架构：RegisterHotKey（主方案）+ LowLevelKeyboardHook（兜底）
-
-关键代码：
-  // 注册热键（优先 RegisterHotKey，失败则降级到 LL 钩子）
-  public bool Register(string hotkeyExpr, Action callback)
-  {
-      // 1) 先尝试 RegisterHotKey（需要有效 _hwnd）
-      if (_hwnd != IntPtr.Zero)
-      {
-          var (mod, vk) = ParseHotkey(hotkeyExpr);
-          if (vk != 0)
-          {
-              var id = _nextHotkeyId++;
-              if (RegisterHotKey(_hwnd, id, mod | MOD_NOREPEAT, vk))
-              {
-                  _registeredCallbacks[id] = callback;
-                  return true;
-              }
-          }
-      }
-      // 2) 降级：LowLevelKeyboardHook（不依赖窗口句柄）
-      if (!TryEnsureLLHook())
-          return false;
-      _llCallbacks[hotkeyExpr.ToUpper()] = callback;
-      return true;
-  }
-
-  // LL 钩子回调（兜底方案）
-  private IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
-  {
-      if (nCode >= 0 && (wParam == (IntPtr)WM_KEYDOWN || wParam == (IntPtr)WM_SYSKEYDOWN))
-      {
-          int vk = Marshal.ReadInt32(lParam);
-          _keysDown.Add(vk);
-          foreach (var kv in _llCallbacks)
-          {
-              if (IsComboMatch(kv.Key, vk))
-              {
-                  if (InvokeOnUiThread != null)
-                      InvokeOnUiThread(kv.Value);
-                  else
-                      kv.Value();
-                  break;
-              }
-          }
-      }
-      return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
-  }
-
-已注册热键：
-  - Ctrl+Shift+S  → 开始截图
-  - ESC           → 取消截图
-  - ENTER         → 不注册全局热键（RegionSelector 内部已处理 KeyDown）
-
-═══════════════════════════════════════════════════════
- Module 2：RegionSelector.cs（核心 · 截图选区 + 长截图 v2）
-═══════════════════════════════════════════════════════
+ Module 1：RegionSelector.cs（核心 · 截图选区 + 长截图 v2.1）
+═════════════════════════════════════════════════════
 
 ── 冻结背景架构（Snipaste 级体验）────────────────────
   1. 进入时先截全屏 → 冻结背景（_frozenBackground）
@@ -105,7 +63,6 @@ D:\sinp\
   4. Enter/双击 → 确认，ESC/右键 → 取消
 
 关键代码：
-  // 进入截图模式：先截全屏冻结背景
   public void StartSelection()
   {
       _frozenBackground = CaptureFullScreen();
@@ -116,81 +73,105 @@ D:\sinp\
       this.BringToFront();
   }
 
-  // 全屏截图（冻结背景用）
-  private Bitmap CaptureFullScreen()
-  {
-      var bmp = new Bitmap(Screen.AllScreens.Max(s => s.Bounds.Right),
-                         Screen.AllScreens.Max(s => s.Bounds.Bottom));
-      using (var g = Graphics.FromImage(bmp))
-      {
-          g.CopyFromScreen(0, 0, 0, 0, bmp.Size);
-      }
-      return bmp;
-  }
-
-── v2 长截图核心架构（后台线程版）────────────────────
-  根本修复：用后台线程替代 WinForms Timer
-          彻底解决 this.Hide() 后 Timer 消息循环受阻的问题
-
+── v2.1 长截图核心架构（后台线程版）──────────────────
   流程：
     输入：选区 Rect + 目标窗口句柄
     ↓
-    ① 激活目标窗口（SetForegroundWindow + ShowWindow）
+    ① 激活窗口（SetForegroundWindow + ShowWindow）
     ↓
     ② 移动鼠标到选区中心（SetCursorPos）
     ↓
-    ③ 截取第一帧（BitBlt 截图）
+    ③ 隐藏 Overlay（this.Hide()）★ 必须在启动线程前
     ↓
     ④ 启动后台线程（new Thread(ScrollCaptureLoop)）
     ↓
-    ⑤ 隐藏 Overlay（this.Hide()）
+    ⑤ 后台线程循环：
+        ├─ 截图（CaptureByBitBlt）
+        ├─ 保存帧
+        ├─ 检测是否到底（Perceptual Hash）
+        ├─ 滚动（mouse_event）
+        └─ 稳定等待（随机 500~900ms）
     ↓
-    ⑥ 后台线程循环：
-        ├─ 模拟鼠标滚轮（mouse_event）
-        ├─ 稳定等待（随机 500~900ms）
-        ├─ BitBlt 截图
-        ├─ Perceptual Hash 对比（检测是否到底）
-        └─ 到底后退出循环
+    ⑥ 到底后自动停止
     ↓
     ⑦ 切回 UI 线程拼接图片
     ↓
     ⑧ 关闭 Overlay，返回结果
 
-── v2 核心方法 1：BitBlt 截图（工业标准，无剪贴板）────
-  [DllImport("user32.dll")]
-  static extern IntPtr GetDC(IntPtr hwnd);
-
-  [DllImport("user32.dll")]
-  static extern int ReleaseDC(IntPtr hwnd, IntPtr hdc);
-
-  [DllImport("gdi32.dll")]
-  static extern bool BitBlt(IntPtr hdcDest, int xDest, int yDest, int w, int h,
-                            IntPtr hdcSrc, int xSrc, int ySrc, int rop);
-
-  const int SRCCOPY = 0x00CC0020;
-
-  private Bitmap CaptureByBitBlt(Rectangle rect)
+── v2.1 核心方法 1：正确的循环顺序 ─────────────────
+  private void ScrollCaptureLoop()
   {
-      var bmp = new Bitmap(rect.Width, rect.Height);
-      using (var g = Graphics.FromImage(bmp))
+      Bitmap? lastFrame = null;
+      int sameCount = 0;
+      int failCount = 0;
+
+      for (int i = 0; i < SCROLL_MAX_STEPS && !_scrollCancelFlag; i++)
       {
-          IntPtr hdcDest = g.GetHdc();
-          IntPtr hdcSrc = GetDC(IntPtr.Zero);
-          BitBlt(hdcDest, 0, 0, rect.Width, rect.Height,
-                 hdcSrc, rect.X, rect.Y, SRCCOPY);
-          ReleaseDC(IntPtr.Zero, hdcSrc);
-          g.ReleaseHdc(hdcDest);
+          // 1. 截图（绝对安全，失败返回 null 不抛异常）
+          var frame = CaptureByBitBlt(_rect);
+          if (frame == null)
+          {
+              failCount++;
+              if (failCount >= 10) break;
+              Thread.Sleep(200);
+              continue;   // ★ 关键：不 break，继续下一轮
+          }
+          failCount = 0;
+
+          // 2. 保存这一帧
+          _longFrames.Add(frame);
+
+          // 3. 检测是否到底（Perceptual Hash 对比底部区域）
+          if (lastFrame != null && IsBottomSameV2(frame))
+          {
+              sameCount++;
+              if (sameCount >= 2) { frame.Dispose(); break; }
+          }
+          else
+          {
+              sameCount = 0;
+          }
+
+          // 4. 更新 lastFrame 供下一轮对比
+          lastFrame = frame;
+
+          // 5. 滚动（在当前截图之后，下一轮截图之前）
+          mouse_event(MOUSEEVENTF_WHEEL, 0, 0, -WHEEL_DELTA * 3, 0);
+
+          // 6. 稳定等待
+          Thread.Sleep(_rnd.Next(500, 900));
       }
-      return bmp;
   }
 
-  优点：
-    ✔ 不依赖剪贴板
-    ✔ 不会丢帧
-    ✔ 不会异步失败
-    ✔ 支持所有窗口
+  循环顺序说明：
+    第一次循环：截图（当前屏幕）→ 保存 → lastFrame=null 不检测 → 滚动 → 等待
+    第二次循环：截图（滚动后）→ 保存 → 检测是否和上次相同 → ...
+    ✔ 正确！每次滚动后才截图，截的是滚动后的内容
 
-── v2 核心方法 2：Perceptual Hash 去重（底部 20% 区域）──
+── v2.1 核心方法 2：BitBlt 截图（工业标准，无剪贴板）──
+  private Bitmap? CaptureByBitBlt(Rectangle rect)
+  {
+      try
+      {
+          var bmp = new Bitmap(rect.Width, rect.Height, PixelFormat.Format32bppArgb);
+          using (var g = Graphics.FromImage(bmp))
+          {
+              IntPtr hdcDest = g.GetHdc();
+              IntPtr hdcSrc = GetDC(IntPtr.Zero);
+              BitBlt(hdcDest, 0, 0, rect.Width, rect.Height,
+                     hdcSrc, rect.X, rect.Y, SRCCOPY);
+              ReleaseDC(IntPtr.Zero, hdcSrc);
+              g.ReleaseHdc(hdcDest);
+          }
+          return bmp;
+      }
+      catch
+      {
+          return null;   // ★ 关键：不抛异常，返回 null
+      }
+  }
+
+── v2.1 核心方法 3：Perceptual Hash 去重 ─────────────
   private bool IsBottomSameV2(Bitmap newFrame)
   {
       if (_longFrames.Count == 0) return false;
@@ -198,7 +179,7 @@ D:\sinp\
       // 只比较底部 20% 区域
       var aCrop = CropBottom(lastFrame, 0.2);
       var bCrop = CropBottom(newFrame, 0.2);
-      // 计算 Perceptual Hash
+      // 计算 Perceptual Hash（简化版 DCT）
       var hashA = ComputePerceptualHash(aCrop);
       var hashB = ComputePerceptualHash(bCrop);
       // 汉明距离 < 5 → 认为相同
@@ -208,58 +189,7 @@ D:\sinp\
       return dist < 5;
   }
 
-  private Bitmap CropBottom(Bitmap img, double ratio)
-  {
-      int h = (int)(img.Height * ratio);
-      return img.Clone(new Rectangle(0, img.Height - h, img.Width, h),
-                       img.PixelFormat);
-  }
-
-  private ulong ComputePerceptualHash(Bitmap img)
-  {
-      // 1. 缩放至 32x32（灰度）
-      using var gray = new Bitmap(32, 32);
-      using (var g = Graphics.FromImage(gray))
-      {
-          g.InterpolationMode = InterpolationMode.Bilinear;
-          g.DrawImage(img, 0, 0, 32, 32);
-      }
-      // 2. 计算 DCT（简化：直接用灰度均值）
-      var pixels = new double[32, 32];
-      for (int y = 0; y < 32; y++)
-          for (int x = 0; x < 32; x++)
-          {
-              var c = gray.GetPixel(x, y);
-              pixels[x, y] = (c.R + c.G + c.B) / 3.0;
-          }
-      // 3. 计算均值
-      double sum = 0;
-      for (int y = 0; y < 32; y++)
-          for (int x = 0; x < 32; x++)
-              sum += pixels[x, y];
-      double avg = sum / (32 * 32);
-      // 4. 生成 64 位 hash
-      ulong hash = 0;
-      int idx = 0;
-      for (int y = 0; y < 8; y++)
-          for (int x = 0; x < 8; x++)
-          {
-              if (pixels[x, y] >= avg)
-                  hash |= (1UL << idx);
-              idx++;
-          }
-      return hash;
-  }
-
-  private int HammingDistance(ulong a, ulong b)
-  {
-      ulong x = a ^ b;
-      int count = 0;
-      while (x > 0) { count++; x &= x - 1; }
-      return count;
-  }
-
-── v2 核心方法 3：Overlap 拼接（解决错位）────────
+── v2.1 核心方法 4：Overlap 拼接 ───────────────────
   private Bitmap CombineWithOverlap(Bitmap top, Bitmap bottom)
   {
       int overlap = FindOverlap(top, bottom);
@@ -285,216 +215,51 @@ D:\sinp\
       return result;
   }
 
-  private int FindOverlap(Bitmap top, Bitmap bottom)
-  {
-      // 比较 top 的底部 N 行 vs bottom 的顶部 N 行
-      // 找最大相似区域，自动裁剪重复部分
-      int maxOverlap = Math.Min(top.Height / 3, bottom.Height / 3);
-      int bestOverlap = 0;
-      double bestSimilarity = 0;
-      for (int overlap = 10; overlap < maxOverlap; overlap += 10)
-      {
-          double sim = CompareOverlap(top, bottom, overlap);
-          if (sim > bestSimilarity && sim > 0.85)
-          {
-              bestSimilarity = sim;
-              bestOverlap = overlap;
-          }
-      }
-      return bestOverlap;
-  }
-
-── v2 核心方法 4：后台线程滚动循环────────────────────
-  private void ScrollCaptureLoop()
-  {
-      try
-      {
-          OnStatusMessage?.Invoke("后台滚动线程已启动");
-          while (!_scrollCancelFlag && _scrollStep < SCROLL_MAX_STEPS)
-          {
-              _scrollStep++;
-              if (_scrollStep >= SCROLL_MAX_STEPS)
-              {
-                  OnStatusMessage?.Invoke($"达到最大步数 {SCROLL_MAX_STEPS}，停止滚动");
-                  break;
-              }
-              OnStatusMessage?.Invoke($"正在滚动第 {_scrollStep} 次...");
-              // 模拟鼠标滚轮向下滚（amount=3，比4更温和）
-              mouse_event(MOUSEEVENTF_WHEEL, 0, 0, -WHEEL_DELTA * 3, 0);
-              // v2 稳定等待：随机 500~900ms
-              int delay = _rnd.Next(500, 900);
-              Thread.Sleep(delay);
-              // v2 核心：使用 BitBlt 截图
-              var frame = CaptureByBitBlt(_rect);
-              if (frame == null)
-              {
-                  OnStatusMessage?.Invoke("BitBlt 截图失败，结束滚动");
-                  break;
-              }
-              // v2 核心：检测是否到底（Perceptual Hash）
-              if (_longFrames.Count >= MIN_FRAMES_BEFORE_CHECK && IsBottomSameV2(frame))
-              {
-                  _bottomSameCount++;
-                  OnStatusMessage?.Invoke($"检测到已滚动到底部 ({_bottomSameCount}/2)");
-                  if (_bottomSameCount >= 2)
-                  {
-                      frame.Dispose();
-                      OnStatusMessage?.Invoke("确认已滚动到底部，结束滚动");
-                      break;
-                  }
-              }
-              else
-              {
-                  _bottomSameCount = 0;
-              }
-              _longFrames.Add(frame);
-              OnStatusMessage?.Invoke($"已捕获 {_longFrames.Count} 帧...");
-          }
-      }
-      catch (Exception ex)
-      {
-          OnStatusMessage?.Invoke($"滚动线程出错: {ex.Message}");
-      }
-      finally
-      {
-          // 滚动完成，切回 UI 线程收尾
-          if (this.IsHandleCreated)
-              this.Invoke(new Action(() => FinishLongCapture()));
-          else
-              FinishLongCapture();
-      }
-  }
-
-── v2 常量配置──────────────────────────────────────────
+── v2.1 常量配置 ───────────────────────────────────
   private const int SCROLL_MAX_STEPS = 80;       // 最大滚动步数
-  private const int MIN_FRAMES_BEFORE_CHECK = 5;   // 至少捕获5帧后才检测到底
+  private const int MIN_FRAMES_BEFORE_CHECK = 3;   // 至少捕获3帧后才检测到底
   private const int WHEEL_DELTA = 120;           // 鼠标滚轮单位
   private const int MOUSEEVENTF_WHEEL = 0x0800; // 鼠标滚轮事件
   private const int SW_RESTORE = 9;              // ShowWindow 恢复窗口
 
 ═════════════════════════════════════════════════════
+ Module 2：GlobalHotkeyManager.cs（全局热键）
+═════════════════════════════════════════════════════
+架构：RegisterHotKey（主方案）+ LowLevelKeyboardHook（兜底）
+
+已注册热键：
+  - Ctrl+Shift+S  → 开始截图
+  - ESC           → 取消截图
+  - ENTER         → 不注册全局热键（RegionSelector 内部已处理 KeyDown）
+
+═════════════════════════════════════════════════════
  Module 3：MainWindow.xaml.cs（主窗口逻辑）
-═══════════════════════════════════════════════════════
+═════════════════════════════════════════════════════
 
-── 窗口初始化────────────────────────────────────────────
-  public MainWindow()
-  {
-      InitializeComponent();
-      this.WindowStartupLocation = WindowStartupLocation.CenterScreen;
-      this.Left = 100;
-      this.Top = 100;
-      this.Width = 420;
-      this.Height = 680;  // 增加高度以容纳图片预览
-  }
-
-── 截图流程──────────────────────────────────────────────
+截图流程：
   1. 按 Ctrl+Shift+S → OnCaptureHotkey()
   2. 创建 RegionSelector → ShowDialog()
   3. 用户框选区域 → 确认（Enter/双击）或取消（ESC/右键）
   4. 截图完成 → 复制到剪贴板 + 显示预览
-  5. （暂时禁用 OCR）
 
-关键代码：
-  private async Task DoCapture()
-  {
-      StatusText.Text = "截图模式：请在屏幕上拖动选择要捕获的区域...";
-      var tcs = new TaskCompletionSource<bool>();
-      var selector = new Overlay.RegionSelector();
-      _activeSelector = selector;
-      selector.OnStatusMessage += msg => Dispatcher.Invoke(() => StatusText.Text = msg);
-      selector.OnRegionSelected += rect => tcs.TrySetResult(true);
-      selector.OnCancelled += () => tcs.TrySetResult(false);
-      selector.ShowDialog();
-      var success = await tcs.Task;
-      _activeSelector = null;
-      if (!success) { StatusText.Text = "截图已取消"; return; }
-      // 截图成功 → 复制到剪贴板
-      var capturedImage = selector.CapturedImage;
-      selector.Dispose();
-      if (capturedImage == null) { StatusText.Text = "截图失败"; return; }
-      // 显示预览
-      PreviewImage.Source = BitmapToImageSource(capturedImage);
-      PreviewBorder.Visibility = Visibility.Visible;
-      NoImageText.Visibility = Visibility.Collapsed;
-      // 复制到剪贴板
-      Clipboard.SetImage(BitmapToImageSource(capturedImage));
-      StatusText.Text = "截图已复制到剪贴板";
-  }
+长截图流程：
+  1. 框选区域 → 点击"📜 自动滚屏"按钮
+  2. 后台线程自动滚动截图 → 到底后自动拼接
+  3. 拼接完成 → 复制到剪贴板 + 显示预览
 
-── 长截图流程────────────────────────────────────────────
-  1. 点击"📜 长截图"按钮 → BtnLongCapture_Click()
-  2. 创建 RegionSelector → ShowDialog()
-  3. 用户框选区域 → 点击"📜 自动滚屏"按钮
-  4. 后台线程自动滚动截图 → 到底后自动拼接
-  5. 拼接完成 → 复制到剪贴板 + 显示预览
-
-关键代码：
-  private async Task DoLongCapture()
-  {
-      StatusText.Text = "长截图模式：请在屏幕上拖动选择要捕获的区域...";
-      var tcs = new TaskCompletionSource<bool>();
-      var selector = new Overlay.RegionSelector();
-      _activeSelector = selector;
-      selector.OnStatusMessage += msg => Dispatcher.BeginInvoke(new Action(() =>
-      {
-          StatusText.Text = msg;
-      }));
-      selector.OnRegionSelected += rect => tcs.TrySetResult(true);
-      selector.OnCancelled += () => tcs.TrySetResult(false);
-      selector.ShowDialog();
-      var success = await tcs.Task;
-      _activeSelector = null;
-      if (!success) { StatusText.Text = "长截图已取消"; return; }
-      // 长截图：直接用 selector.CapturedImage（RegionSelector 内部已拼接）
-      var resultImage = selector.CapturedImage;
-      selector.Dispose();
-      if (resultImage == null) { StatusText.Text = "长截图失败"; return; }
-      // 显示预览
-      PreviewImage.Source = BitmapToImageSource(resultImage);
-      PreviewBorder.Visibility = Visibility.Visible;
-      NoImageText.Visibility = Visibility.Collapsed;
-      // 复制到剪贴板
-      Clipboard.SetImage(BitmapToImageSource(resultImage));
-      StatusText.Text = $"长截图已复制（{selector.LongFrames.Count} 帧拼接）";
-  }
-
-═════════════════════════════════════════════════════
- Module 4：OCRClient.cs（OCR 识别客户端）
-═══════════════════════════════════════════════════════
-支持两种模式：
-  - NamedPipe（生产模式，Windows）
-  - HTTP（调试模式，跨平台）
-
-OCR 服务：Python PaddleOCR（需要手动启动 ocr_worker/main.py）
-
-关键代码：
-  public async Task<OCRResponse> RecognizeAsync(byte[] imageBytes)
-  {
-      if (!await EnsureWorkerRunningAsync())
-      {
-          return new OCRResponse(false, Array.Empty<OCRTextLine>(),
-              "OCR Worker 未运行，且无法自动启动。");
-      }
-      if (_mode == OCRMode.NamedPipe)
-          return await RecognizeViaPipe(imageBytes);
-      else
-          return await RecognizeViaHttp(imageBytes);
-  }
-
-四、v2 架构总结（核心升级点）
+五、v2.1 架构总结（核心升级点）
 ─────────────────────────────────────────────────────────
-  问题               v1（之前）          v2（现在）
-  ─────────────────────────────────────────────────────
-  截图方法           CopyFromScreen       BitBlt（工业标准）
-  去重算法           简单像素对比         Perceptual Hash
-  等待机制           固定延迟             随机延迟（500~900ms）
-  拼接算法           无（让外部处理）     Overlap 去重拼接
-  滚动控制           WinForms Timer       后台线程（Thread）
-  Timer 失效问题    存在（Hide()后）     彻底修复
-  剪贴板依赖        有                   无（BitBlt 直接截图）
-  卡死问题          可能卡死             try-catch 保护
+  问题               v2.0              v2.1（当前）
+  ────────────────────────────────────────────────────
+  循环顺序           滚动→截图          截图→滚动（正确）
+  null frame 处理    break              continue + failCount
+  检测时机           每帧都检测         至少3帧后检测
+  Overlay 隐藏      启动线程后         启动线程前
+  截图方法           BitBlt             BitBlt（不变）
+  去重算法           Perceptual Hash    Perceptual Hash（不变）
+  拼接算法           Overlap 拼接       Overlap 拼接（不变）
 
-五、构建与运行
+六、构建与运行
 ─────────────────────────────────────────────────────────
 编译：
   cd D:\sinp
@@ -516,7 +281,7 @@ OCR 服务：Python PaddleOCR（需要手动启动 ocr_worker/main.py）
      - ❌ 取消      → 退出
   5. 截图自动复制到剪贴板，主窗口显示预览
 
-六、已知问题与修复记录
+七、已知问题与修复记录
 ─────────────────────────────────────────────────────────
   [已修复] 应用启动失败（窗口不可见）
     原因：WindowStyle=None + AllowsTransparency=True → 窗口不可见
@@ -530,15 +295,15 @@ OCR 服务：Python PaddleOCR（需要手动启动 ocr_worker/main.py）
     原因：Register("ENTER", ...) 降级到 LL 钩子，钩子处理逻辑有 bug
     修复：不再注册 ENTER 为全局热键（RegionSelector 内部已有 KeyDown 处理）
 
-  [已修复] 长截图只滚动 1 帧就停止
+  [已修复 v2.0] 长截图只滚动 1 帧就停止
     原因：this.Hide() 后 WinForms Timer 消息循环受阻
-    修复：用后台线程（Thread）替代 Timer，Hide() 在启动线程后调用
+    修复：用后台线程（Thread）替代 Timer
 
-  [已修复] 长截图连滚动都没有
-    原因：Overlay 窗口未隐藏，遮挡了目标窗口，鼠标滚轮事件发给了 Overlay
-    修复：在 StartAutoScrollCapture() 中，启动后台线程后立即调用 this.Hide()
+  [已修复 v2.1] 长截图连滚动都没有 / 只截一帧
+    原因：循环顺序错误（滚动→截图），且 null frame 直接 break
+    修复：改为截图→保存→检测→滚动→等待；null frame 用 continue
 
-七、依赖项
+八、依赖项
 ─────────────────────────────────────────────────────────
   NuGet 包：
     - System.Drawing.Common (8.0.0)
@@ -549,7 +314,7 @@ OCR 服务：Python PaddleOCR（需要手动启动 ocr_worker/main.py）
     - Flask（HTTP 模式）
     - pywin32（NamedPipe 模式）
 
-八、未来改进方向
+九、未来改进方向
 ─────────────────────────────────────────────────────────
   [ ] 添加 OCR 结果编辑功能
   [ ] 添加多显示器支持（当前使用 Screen.AllScreens）

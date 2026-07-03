@@ -1,0 +1,40 @@
+## .NET build output
+**/bin/
+**/obj/
+**/publish/
+
+## Logs
+logs/
+*.log
+
+## IDE / Editor
+.vs/
+.vscode/
+*.user
+*.suo
+*.*~
+
+## OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+## Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+env/
+.env
+
+## Secrets
+*.pfx
+*.p12
+appsettings.Development.json
+appsettings.Local.json
+
+## Build scripts output
+*.exe
+*.dll
+*.pdb

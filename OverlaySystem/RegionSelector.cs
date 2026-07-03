@@ -4,92 +4,102 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
+using System.Threading;
 
 namespace Sinp.Overlay
 {
     /// <summary>
     /// 截图选区窗口 — Snipaste 级体验
     ///
-    /// 核心架构（不是透明画图，是截图冻结层）：
+    /// 核心架构（冻结背景层）：
     ///   1. 进入时先截全屏 → 冻结背景
-    ///   2. 在冻结背景上画选区（选区透明，露出截图）
+    ///   2. 在冻结背景上画选区 + 半透明遮罩
     ///   3. 选区固定后显示 ActionBar
-    ///   4. Enter/双击/确认按钮 → 回调选区
+    ///   4. Enter/双击 → 确认，ESC/右键 → 取消
+    ///   5. 长截图按钮 → 自动滚动捕获（Snipaste 模式）
     ///
-    /// 交互：
-    ///   鼠标拖动 → 创建选区
-    ///   松开 → 选区固定 + ActionBar 出现
-    ///   拖边框/角 → 调整大小
-    ///   拖内部 → 移动
-    ///   Enter → 确认
-    ///   ESC/右键 → 取消
+    /// 长截图自动滚动流程：
+    ///   点击 "📜 自动滚屏" → 隐藏 Overlay → 定位目标窗口
+    ///   → 发送 PageDown 滚动 → 截取新帧 → 对比检测是否到底
+    ///   → 到底后自动拼接 → 关闭并返回结果
     /// </summary>
     public class RegionSelector : Form
     {
         private const int WS_EX_NOACTIVATE = 0x08000000;
         private const int WS_EX_TOOLWINDOW = 0x00000080;
 
+        // ── Win32 API（自动滚动用）────────────────────────
+        [DllImport("user32.dll")]
+        private static extern IntPtr WindowFromPoint(POINT Point);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern IntPtr SendMessage(IntPtr hWnd, uint msg, UIntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+        // WM_VSCROLL 参数
+        private const uint WM_VSCROLL = 0x0115;
+        private static readonly UIntPtr SB_PAGEDOWN = new UIntPtr(3);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct POINT { public int X; public int Y; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+
         // 冻结背景（全屏截图）
         private Bitmap? _frozenBackground;
 
-        // 最终裁剪结果（从冻结背景裁剪，不是二次截屏）
+        // 最终裁剪结果
         public Bitmap? CapturedImage { get; private set; }
 
         // 选区
-        private enum DragMode { None, Create, Move, ResizeTop, ResizeBottom, ResizeLeft, ResizeRight, ResizeTopLeft, ResizeTopRight, ResizeBottomLeft, ResizeBottomRight }
+        private enum DragMode { None, Create, Move, ResizeTop, ResizeBottom, ResizeLeft, ResizeRight,
+                               ResizeTopLeft, ResizeTopRight, ResizeBottomLeft, ResizeBottomRight }
         private DragMode _dragMode = DragMode.None;
         private Point _startPoint;
         private Rectangle _rect;
         private Rectangle _rectBefore;
 
         // ActionBar
-        private readonly string[] _toolLabels = { "✓ 确认", "✗ 取消", "🔍 OCR", "💾 保存", "📋 复制", "📜 长截图" };
+        private readonly string[] _toolLabels = { "✓ 确认", "✗ 取消", "🔍 OCR", "💾 保存", "📋 复制", "📜 自动滚屏" };
         private int _hoverToolIndex = -1;
         private const int TOOL_BTN_HEIGHT = 36;
         private const int TOOL_BTN_WIDTH = 78;
 
-        // 长截图模式
-        private bool _longScreenshotMode = false;
+        // 长截图状态
+        private bool _longScreenshotActive = false;       // 是否正在自动滚动
         private readonly List<Bitmap> _longFrames = new();
         public IReadOnlyList<Bitmap> LongFrames => _longFrames.AsReadOnly();
         public bool IsLongScreenshot { get; private set; } = false;
 
-        // 结果
+        // 自动滚动定时器
+        private System.Windows.Forms.Timer? _scrollTimer;
+
+        // 结果事件
         public Rectangle? SelectedRegion { get; private set; }
         public event Action<Rectangle>? OnRegionSelected;
         public event Action? OnCancelled;
-        public event Action<string>? OnStatusMessage;  // 长截图状态提示
+        public event Action<string>? OnStatusMessage;
 
-        /// <summary>
-        /// 程序化触发确认（供外部调用，如 Enter 热键）
-        /// </summary>
         public void TriggerConfirm()
         {
-            if (this.InvokeRequired)
-            {
-                this.Invoke(new Action(ConfirmSelection));
-            }
-            else
-            {
-                ConfirmSelection();
-            }
+            if (this.InvokeRequired) this.Invoke(new Action(ConfirmSelection));
+            else ConfirmSelection();
         }
 
-        public RegionSelector()
-        {
-            InitializeComponent();
-        }
+        // =====================================================
+        //  构造 / 初始化
+        // =====================================================
+        public RegionSelector() { InitializeComponent(); }
 
         protected override bool ShowWithoutActivation => true;
 
         protected override CreateParams CreateParams
         {
-            get
-            {
-                var cp = base.CreateParams;
-                cp.ExStyle |= WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
-                return cp;
-            }
+            get { var cp = base.CreateParams; cp.ExStyle |= WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW; return cp; }
         }
 
         private void InitializeComponent()
@@ -103,71 +113,45 @@ namespace Sinp.Overlay
             this.StartPosition = FormStartPosition.Manual;
             this.Bounds = SystemInformation.VirtualScreen;
 
-            // 关键：先截全屏作为冻结背景
             CaptureFrozenBackground();
 
             this.KeyDown += (s, e) =>
             {
+                if (_longScreenshotActive) return; // 滚动中忽略键盘
                 if (e.KeyCode == Keys.Enter || e.KeyCode == Keys.Return)
-                {
-                    if (_longScreenshotMode)
-                        ConfirmLongScreenshot();
-                    else
-                        ConfirmSelection();
-                }
+                    ConfirmSelection();
                 else if (e.KeyCode == Keys.Escape)
-                {
                     Cancel();
-                }
-                else if (e.KeyCode == Keys.Space && _longScreenshotMode)
-                {
-                    // 空格键：捕获当前视口帧
-                    CaptureLongFrame();
-                }
             };
         }
 
-        /// <summary>
-        /// 截取全屏作为冻结背景（关键步骤！）
-        /// 这样选区看起来是"透明"的，实际是露出冻结的截图
-        /// </summary>
         private void CaptureFrozenBackground()
         {
             var bounds = SystemInformation.VirtualScreen;
             _frozenBackground = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format32bppArgb);
             using (var g = Graphics.FromImage(_frozenBackground))
-            {
                 g.CopyFromScreen(bounds.X, bounds.Y, 0, 0, bounds.Size, CopyPixelOperation.SourceCopy);
-            }
-            // 设置为窗口背景（这样窗口不透明，但看起来像桌面）
             this.BackgroundImage = _frozenBackground;
             this.BackgroundImageLayout = ImageLayout.None;
         }
 
-        // ── 鼠标事件 ───────────────────────────────────────
+        // =====================================================
+        //  鼠标事件
+        // =====================================================
         protected override void OnMouseDown(MouseEventArgs e)
         {
+            if (_longScreenshotActive) return;
+
             if (e.Button == MouseButtons.Left)
             {
-                int toolIndex = HitTestToolButton(e.Location);
-                if (toolIndex >= 0)
-                {
-                    ExecuteToolCommand(toolIndex);
-                    return;
-                }
+                if (HitTestToolButton(e.Location) >= 0)
+                    ExecuteToolCommand(HitTestToolButton(e.Location));
 
                 _startPoint = e.Location;
                 _dragMode = GetDragModeAt(e.Location);
-
                 if (_dragMode == DragMode.None)
-                {
-                    _rect = new Rectangle(e.Location, Size.Empty);
-                    _dragMode = DragMode.Create;
-                }
-                else
-                {
-                    _rectBefore = _rect;
-                }
+                    { _rect = new Rectangle(e.Location, Size.Empty); _dragMode = DragMode.Create; }
+                else _rectBefore = _rect;
                 this.Invalidate();
             }
             else if (e.Button == MouseButtons.Right)
@@ -179,67 +163,33 @@ namespace Sinp.Overlay
 
         protected override void OnMouseMove(MouseEventArgs e)
         {
-            if (e.Button == MouseButtons.Left)
+            if (_longScreenshotActive) return;
+
+            if (e.Button == MouseButtons.Left && _dragMode != DragMode.None)
             {
                 switch (_dragMode)
                 {
-                    case DragMode.Create:
-                        _rect = NormalizeRect(_startPoint, e.Location);
-                        break;
+                    case DragMode.Create: _rect = NormalizeRect(_startPoint, e.Location); break;
                     case DragMode.Move:
                         _rect = new Rectangle(
                             _rectBefore.X + e.Location.X - _startPoint.X,
                             _rectBefore.Y + e.Location.Y - _startPoint.Y,
-                            _rectBefore.Width, _rectBefore.Height);
-                        break;
-                    case DragMode.ResizeRight:
-                        _rect.Width = Math.Max(10, e.Location.X - _rect.X);
-                        break;
-                    case DragMode.ResizeBottom:
-                        _rect.Height = Math.Max(10, e.Location.Y - _rect.Y);
-                        break;
-                    case DragMode.ResizeLeft:
-                        int oldRight = _rect.Right;
-                        _rect.X = Math.Min(e.Location.X, oldRight - 10);
-                        _rect.Width = oldRight - _rect.X;
-                        break;
-                    case DragMode.ResizeTop:
-                        int oldBottom = _rect.Bottom;
-                        _rect.Y = Math.Min(e.Location.Y, oldBottom - 10);
-                        _rect.Height = oldBottom - _rect.Y;
-                        break;
-                    case DragMode.ResizeTopLeft:
-                        int tlRight = _rect.Right;
-                        int tlBottom = _rect.Bottom;
-                        _rect.X = Math.Min(e.Location.X, tlRight - 10);
-                        _rect.Y = Math.Min(e.Location.Y, tlBottom - 10);
-                        _rect.Width = tlRight - _rect.X;
-                        _rect.Height = tlBottom - _rect.Y;
-                        break;
-                    case DragMode.ResizeTopRight:
-                        _rect.Y = Math.Min(e.Location.Y, _rect.Bottom - 10);
-                        _rect.Height = _rect.Bottom - _rect.Y;
-                        _rect.Width = Math.Max(10, e.Location.X - _rect.X);
-                        break;
-                    case DragMode.ResizeBottomLeft:
-                        _rect.X = Math.Min(e.Location.X, _rect.Right - 10);
-                        _rect.Width = _rect.Right - _rect.X;
-                        _rect.Height = Math.Max(10, e.Location.Y - _rect.Y);
-                        break;
-                    case DragMode.ResizeBottomRight:
-                        _rect.Width = Math.Max(10, e.Location.X - _rect.X);
-                        _rect.Height = Math.Max(10, e.Location.Y - _rect.Y);
-                        break;
+                            _rectBefore.Width, _rectBefore.Height); break;
+                    case DragMode.ResizeRight: _rect.Width = Math.Max(10, e.Location.X - _rect.X); break;
+                    case DragMode.ResizeBottom: _rect.Height = Math.Max(10, e.Location.Y - _rect.Y); break;
+                    case DragMode.ResizeLeft: int or2 = _rect.Right; _rect.X = Math.Min(e.Location.X, or2 - 10); _rect.Width = or2 - _rect.X; break;
+                    case DragMode.ResizeTop: int ob2 = _rect.Bottom; _rect.Y = Math.Min(e.Location.Y, ob2 - 10); _rect.Height = ob2 - _rect.Y; break;
+                    case DragMode.ResizeTopLeft: int tlr = _rect.Right, tlb = _rect.Bottom; _rect.X = Math.Min(e.Location.X, tlr-10); _rect.Y = Math.Min(e.Location.Y, tlb-10); _rect.Width = tlr-_rect.X; _rect.Height = tlb-_rect.Y; break;
+                    case DragMode.ResizeTopRight: _rect.Y = Math.Min(e.Location.Y, _rect.Bottom-10); _rect.Height = _rect.Bottom-_rect.Y; _rect.Width = Math.Max(10, e.Location.X-_rect.X); break;
+                    case DragMode.ResizeBottomLeft: _rect.X = Math.Min(e.Location.X, _rect.Right-10); _rect.Width = _rect.Right-_rect.X; _rect.Height = Math.Max(10, e.Location.Y-_rect.Y); break;
+                    case DragMode.ResizeBottomRight: _rect.Width = Math.Max(10, e.Location.X-_rect.X); _rect.Height = Math.Max(10, e.Location.Y-_rect.Y); break;
                 }
                 this.Invalidate();
             }
             else
             {
-                int oldHover = _hoverToolIndex;
-                _hoverToolIndex = HitTestToolButton(e.Location);
-                UpdateCursor(e.Location);
-                if (oldHover != _hoverToolIndex)
-                    this.Invalidate();
+                int oldHover = _hoverToolIndex; _hoverToolIndex = HitTestToolButton(e.Location); UpdateCursor(e.Location);
+                if (oldHover != _hoverToolIndex) this.Invalidate();
             }
             base.OnMouseMove(e);
         }
@@ -249,14 +199,7 @@ namespace Sinp.Overlay
             if (e.Button == MouseButtons.Left)
             {
                 _dragMode = DragMode.None;
-
-                // 关键：鼠标释放时，如果选区有效，设置 SelectedRegion
-                // 这样 MainWindow.ConfirmSelection (Enter 热键) 才能读到有效选区
-                if (_rect.Width > 5 && _rect.Height > 5)
-                {
-                    SelectedRegion = _rect;
-                }
-
+                if (_rect.Width > 5 && _rect.Height > 5) SelectedRegion = _rect;
                 this.Invalidate();
             }
             base.OnMouseUp(e);
@@ -264,118 +207,216 @@ namespace Sinp.Overlay
 
         protected override void OnMouseDoubleClick(MouseEventArgs e)
         {
-            if (e.Button == MouseButtons.Left && _rect.Contains(e.Location))
-                ConfirmSelection();
+            if (e.Button == MouseButtons.Left && _rect.Contains(e.Location)) ConfirmSelection();
             base.OnMouseDoubleClick(e);
         }
 
-        // ── 长截图：捕获当前视口帧 ─────────────────────
-        private void CaptureLongFrame()
-        {
-            if (_rect.Width <= 5 || _rect.Height <= 5 || _frozenBackground == null)
-                return;
-
-            // 从冻结背景裁剪当前选区
-            var frame = new Bitmap(_rect.Width, _rect.Height);
-            using (var g = Graphics.FromImage(frame))
-            {
-                g.DrawImage(_frozenBackground,
-                    new Rectangle(0, 0, _rect.Width, _rect.Height),
-                    _rect, GraphicsUnit.Pixel);
-            }
-            _longFrames.Add(frame);
-
-            // 更新按钮文字：显示已捕获帧数
-            _toolLabels[5] = $"📜 {_longFrames.Count} 帧（空格继续）";
-            _toolLabels[0] = $"✓ 完成（{_longFrames.Count}帧）";
-            this.Invalidate();
-
-            OnStatusMessage?.Invoke($"长截图：已捕获 {_longFrames.Count} 帧，滚动后按空格继续");
-
-            // 重新截屏以捕获滚动后的新内容
-            CaptureFrozenBackground();
-        }
-
-        // ── 长截图：完成拼接 ─────────────────────────────
-        private void ConfirmLongScreenshot()
-        {
-            if (_longFrames.Count == 0)
-            {
-                ConfirmSelection();
-                return;
-            }
-
-            try
-            {
-                // 拼接由 MainWindow 负责，这里只标记完成
-                // （RegionSelector 不引用 StitchEngine，避免循环依赖）
-                IsLongScreenshot = true;
-                // CapturedImage 用最后一帧占位，MainWindow 会用全部帧重新拼接
-                if (_longFrames.Count > 0)
-                    CapturedImage = (Bitmap)_longFrames.Last().Clone();
-                SelectedRegion = _rect;
-                OnRegionSelected?.Invoke(_rect);
-                this.Close();
-            }
-            catch (Exception ex)
-            {
-                OnStatusMessage?.Invoke($"长截图拼接失败：{ex.Message}");
-            }
-
-            // 拼接失败，用最后一帧作为结果
-            if (_longFrames.Count > 0)
-            {
-                CapturedImage = _longFrames.Last();
-                IsLongScreenshot = true;
-                SelectedRegion = _rect;
-                OnRegionSelected?.Invoke(_rect);
-            }
-            this.Close();
-        }
+        // =====================================================
+        //  确认 / 取消
+        // =====================================================
         private void ConfirmSelection()
         {
             if (_rect.Width > 5 && _rect.Height > 5 && _frozenBackground != null)
             {
-                // 关键：直接从冻结背景图裁剪选区，不再二次截屏
-                // 这样不会截到 Overlay 窗口自己
                 CapturedImage = new Bitmap(_rect.Width, _rect.Height);
                 using (var g = Graphics.FromImage(CapturedImage))
-                {
-                    g.DrawImage(_frozenBackground,
-                        new Rectangle(0, 0, _rect.Width, _rect.Height),
-                        _rect, GraphicsUnit.Pixel);
-                }
+                    g.DrawImage(_frozenBackground, new Rectangle(0, 0, _rect.Width, _rect.Height), _rect, GraphicsUnit.Pixel);
                 SelectedRegion = _rect;
+                IsLongScreenshot = false;
                 OnRegionSelected?.Invoke(_rect);
                 this.Close();
-            }
-            else
-            {
-                Cancel();
-            }
+            } else Cancel();
         }
 
         private void Cancel()
         {
+            StopAutoScroll();
             OnCancelled?.Invoke();
             this.Close();
         }
 
-        // ── ActionBar ──────────────────────────────────────
+        // =====================================================
+        //  ★★★ 自动滚动长截图（核心功能）★★★
+        //
+        //  流程：
+        //    ① 隐藏 Overlay 窗口（不遮挡屏幕）
+        //    ② 找到选区下方的目标窗口
+        //    ③ 截取第一帧
+        //    ④ 发送 PageDown 到目标窗口
+        //    ⑤ 等待渲染 → 截取下一帧
+        //    ⑥ 对比两帧是否相同（相同=到底了）
+        //    ⑦ 重复 ④~⑥ 直到到底
+        //    ⑧ 自动拼接所有帧 → 返回结果
+        // =====================================================
+
+        /// <summary>
+        /// 启动自动滚动长截图
+        /// </summary>
+        private async void StartAutoScrollCapture()
+        {
+            if (_rect.Width <= 5 || _rect.Height <= 5) return;
+
+            _longScreenshotActive = true;
+            _longFrames.Clear();
+
+            // 更新 UI 提示
+            _toolLabels[5] = "⏳ 滚动中...";
+            _toolLabels[0] = "⏹ 停止";
+            this.Invalidate();
+            OnStatusMessage?.Invoke("正在自动滚动截图...");
+
+            try
+            {
+                // ① 隐藏自己，让用户看到实际内容
+                this.Hide();
+                await Task.Delay(200); // 等 Overlay 完全消失
+
+                // ② 找到选区中心点下的窗口句柄
+                var centerPt = new POINT { X = _rect.X + _rect.Width / 2, Y = _rect.Y + _rect.Height / 2 };
+                var targetHwnd = WindowFromPoint(centerPt);
+
+                // ③ 截取第一帧（直接从屏幕截）
+                var firstFrame = CaptureScreenRegion(_rect);
+                if (firstFrame != null)
+                    _longFrames.Add(firstFrame);
+
+                OnStatusMessage?.Invoke($"已捕获第 1 帧，开始自动滚动...");
+
+                // ④~⑦ 循环：滚动 → 截图 → 检测是否到底
+                int maxFrames = 50; // 安全上限
+                int noChangeCount = 0; // 连续无变化次数
+
+                for (int frameIdx = 1; frameIdx < maxFrames; frameIdx++)
+                {
+                    // 发送 PageDown 滚动
+                    if (targetHwnd != IntPtr.Zero)
+                        SendMessage(targetHwnd, WM_VSCROLL, SB_PAGEDOWN, IntPtr.Zero);
+                    else
+                        // 兜底：用 SendKeys
+                        SendKeys.SendWait("{PGDN}");
+
+                    // 等待页面渲染（可调）
+                    await Task.Delay(350);
+
+                    // 截取当前屏幕的同一区域
+                    var nextFrame = CaptureScreenRegion(_rect);
+                    if (nextFrame == null) break;
+
+                    // ⑤ 检测是否到底（和上一帧对比）
+                    if (IsSimilarToLast(nextFrame))
+                    {
+                        noChangeCount++;
+                        nextFrame.Dispose(); // 相同帧不要
+                        if (noChangeCount >= 2) break; // 连续2次无变化 → 到底了
+                        continue;
+                    }
+                    noChangeCount = 0;
+                    _longFrames.Add(nextFrame);
+
+                    // 更新进度
+                    string progressMsg = $"已捕获 {_longFrames.Count} 帧...";
+                    OnStatusMessage?.Invoke(progressMsg);
+                }
+
+                // ⑧ 完成！拼接或返回最后一帧
+                OnStatusMessage?.Invoke($"滚动完成！共捕获 {_longFrames.Count} 帧");
+                IsLongScreenshot = true;
+
+                if (_longFrames.Count >= 2)
+                {
+                    // 多帧 → CapturedImage 设为 null，让 MainWindow 用 LongFrames 做拼接
+                    CapturedImage = null;
+                }
+                else if (_longFrames.Count == 1)
+                {
+                    // 只有1帧 → 直接当普通截图
+                    CapturedImage = _longFrames[0];
+                }
+                else
+                {
+                    // 0帧 → 用冻结背景裁剪
+                    CapturedImage = new Bitmap(_rect.Width, _rect.Height);
+                    using (var g = Graphics.FromImage(CapturedImage))
+                        g.DrawImage(_frozenBackground!, new Rectangle(0,0,_rect.Width,_rect.Height), _rect, GraphicsUnit.Pixel);
+                }
+
+                SelectedRegion = _rect;
+                OnRegionSelected?.Invoke(_rect);
+            }
+            catch (Exception ex)
+            {
+                OnStatusMessage?.Invoke($"长截图出错：{ex.Message}");
+                IsLongScreenshot = false;
+            }
+            finally
+            {
+                _longScreenshotActive = false;
+                this.Close();
+            }
+        }
+
+        /// <summary>
+        /// 直接从屏幕截取指定区域（不经过冻结背景）
+        /// </summary>
+        private static Bitmap? CaptureScreenRegion(Rectangle region)
+        {
+            try
+            {
+                var bmp = new Bitmap(region.Width, region.Height, PixelFormat.Format32bppArgb);
+                using (var g = Graphics.FromImage(bmp))
+                    g.CopyFromScreen(region.X, region.Y, 0, 0, region.Size, CopyPixelOperation.SourceCopy);
+                return bmp;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// 检测新帧是否与上一帧相似（判断是否到底）
+        /// </summary>
+        private bool IsSimilarToLast(Bitmap newBmp)
+        {
+            if (_longFrames.Count == 0) return false;
+            var lastBmp = _longFrames[_longFrames.Count - 1];
+            if (newBmp.Size != lastBmp.Size) return false;
+
+            // 抽样比较像素（每 20px 取一个点，性能好够用了）
+            int step = 20, sameCount = 0, total = 0;
+            for (int y = 0; y < newBmp.Height; y += step)
+            {
+                for (int x = 0; x < newBmp.Width; x += step)
+                {
+                    total++;
+                    if (newBmp.GetPixel(x, y).ToArgb() == lastBmp.GetPixel(x, y).ToArgb())
+                        sameCount++;
+                }
+            }
+            // 95% 以上像素相同 → 认为没变化（到底了）
+            return total > 0 && sameCount * 100 / total > 95;
+        }
+
+        /// <summary>
+        /// 停止自动滚动
+        /// </summary>
+        private void StopAutoScroll()
+        {
+            _longScreenshotActive = false;
+            _scrollTimer?.Stop();
+            _scrollTimer?.Dispose();
+            _scrollTimer = null;
+        }
+
+        // =====================================================
+        //  ActionBar
+        // =====================================================
         private Rectangle GetActionBarBounds()
         {
-            if (_rect.Width <= 0 || _rect.Height <= 0)
-                return Rectangle.Empty;
-
-            int totalWidth = _toolLabels.Length * TOOL_BTN_WIDTH + 8;
-            int x = _rect.X + (_rect.Width - totalWidth) / 2;
+            if (_rect.Width <= 0 || _rect.Height <= 0) return Rectangle.Empty;
+            int tw = _toolLabels.Length * TOOL_BTN_WIDTH + 8;
+            int x = _rect.X + (_rect.Width - tw) / 2;
             int y = _rect.Bottom + 8;
-
-            int screenBottom = SystemInformation.VirtualScreen.Bottom;
-            if (y + TOOL_BTN_HEIGHT > screenBottom)
+            if (y + TOOL_BTN_HEIGHT > SystemInformation.VirtualScreen.Bottom)
                 y = _rect.Y - TOOL_BTN_HEIGHT - 8;
-
-            return new Rectangle(x, y, totalWidth, TOOL_BTN_HEIGHT);
+            return new Rectangle(x, y, tw, TOOL_BTN_HEIGHT);
         }
 
         private Rectangle GetToolButtonRect(int index)
@@ -386,13 +427,9 @@ namespace Sinp.Overlay
 
         private int HitTestToolButton(Point p)
         {
-            if (_rect.Width <= 0 || _rect.Height <= 0)
-                return -1;
+            if (_rect.Width <= 0 || _rect.Height <= 0) return -1;
             for (int i = 0; i < _toolLabels.Length; i++)
-            {
-                if (GetToolButtonRect(i).Contains(p))
-                    return i;
-            }
+                if (GetToolButtonRect(i).Contains(p)) return i;
             return -1;
         }
 
@@ -400,198 +437,126 @@ namespace Sinp.Overlay
         {
             switch (index)
             {
-                case 0: // 确认
-                    if (_longScreenshotMode)
-                        ConfirmLongScreenshot();
+                case 0: // 确认 / 停止
+                    if (_longScreenshotActive)
+                        StopAutoScroll();
                     else
                         ConfirmSelection();
                     break;
-                case 1: // 取消
-                    Cancel();
-                    break;
-                case 5: // 📜 长截图
-                    EnterLongScreenshotMode();
-                    break;
-                default:
-                    // OCR / 保存 / 复制 → 先确认选区，再执行
-                    ConfirmSelection();
-                    break;
+                case 1: Cancel(); break;
+                case 5: StartAutoScrollCapture(); break; // 📜 自动滚屏
+                default: ConfirmSelection(); break; // OCR/保存/复制
             }
         }
 
-        /// <summary>
-        /// 进入长截图模式：捕获第一帧，等待用户滚动后按空格捕获更多帧
-        /// </summary>
-        private void EnterLongScreenshotMode()
-        {
-            if (_rect.Width <= 5 || _rect.Height <= 5)
-                return;
-
-            _longScreenshotMode = true;
-
-            // 捕获第一帧
-            CaptureLongFrame();
-
-            // 更新按钮文字：显示已捕获帧数 + 操作提示
-            _toolLabels[5] = $"📜 {_longFrames.Count} 帧（空格继续）";
-            // 替换确认按钮文字
-            _toolLabels[0] = $"✓ 完成（{_longFrames.Count}帧）";
-            this.Invalidate();
-
-            OnStatusMessage?.Invoke($"长截图模式：已捕获 1 帧，滚动页面后按空格捕获下一帧，Enter 完成");
-        }
-
-        // ── 绘制（核心：在冻结背景上画遮罩 + 选区）──────────
+        // =====================================================
+        //  绘制
+        // =====================================================
         protected override void OnPaint(PaintEventArgs e)
         {
-            var g = e.Graphics;
-            g.SmoothingMode = SmoothingMode.AntiAlias;
+            var g = e.Graphics; g.SmoothingMode = SmoothingMode.AntiAlias;
 
             if (_rect.Width > 0 && _rect.Height > 0)
             {
-                // 1. 先画全屏半透明遮罩
-                var screenRect = new Rectangle(0, 0, this.ClientSize.Width, this.ClientSize.Height);
-                using var maskBrush = new SolidBrush(Color.FromArgb(120, 0, 0, 0));
-                g.FillRectangle(maskBrush, screenRect);
+                // 1. 全屏遮罩
+                var sr = new Rectangle(0, 0, ClientSize.Width, ClientSize.Height);
+                using var mb = new SolidBrush(Color.FromArgb(120, 0, 0, 0));
+                g.FillRectangle(mb, sr);
 
-                // 2. 关键修复：选区内部重绘冻结背景（不是 Clear Transparent！）
-                // Clear 会把 BackgroundImage 也擦掉导致黑色
-                // 正确做法：从 _frozenBackground 把选区部分画回来
+                // 2. 选区内画回冻结背景
                 g.DrawImage(_frozenBackground, _rect, _rect, GraphicsUnit.Pixel);
 
-                // 3. 选区边框
-                using var outerPen = new Pen(Color.FromArgb(255, 30, 30, 30), 3);
-                using var innerPen = new Pen(Color.FromArgb(255, 255, 80, 80), 2);
-                g.DrawRectangle(outerPen, _rect.X - 1, _rect.Y - 1, _rect.Width + 2, _rect.Height + 2);
-                g.DrawRectangle(innerPen, _rect);
+                // 3. 边框
+                using var op = new Pen(Color.FromArgb(255, 30, 30, 30), 3);
+                using var ip = new Pen(Color.FromArgb(255, 255, 80, 80), 2);
+                g.DrawRectangle(op, _rect.X-1, _rect.Y-1, _rect.Width+2, _rect.Height+2);
+                g.DrawRectangle(ip, _rect);
 
                 // 4. 尺寸文字
-                var dimText = string.Format("{0} x {1}", _rect.Width, _rect.Height);
-                using var font = new Font("Segoe UI", 11, FontStyle.Bold);
-                var textSize = g.MeasureString(dimText, font);
-                var textRect = new Rectangle(_rect.X, _rect.Y - (int)textSize.Height - 4, (int)textSize.Width + 8, (int)textSize.Height + 4);
-                using var bgBrush = new SolidBrush(Color.FromArgb(220, 255, 80, 80));
-                g.FillRectangle(bgBrush, textRect);
-                using var textBrush = new SolidBrush(Color.White);
-                g.DrawString(dimText, font, textBrush, _rect.X + 4, _rect.Y - (int)textSize.Height - 2);
+                var dt = $"{_rect.Width} x {_rect.Height}";
+                using var f = new Font("Segoe UI", 11, FontStyle.Bold);
+                var ts = g.MeasureString(dt, f);
+                var tr = new Rectangle(_rect.X, _rect.Y-(int)ts.Height-4, (int)ts.Width+8, (int)ts.Height+4);
+                using var tb = new SolidBrush(Color.FromArgb(220, 255, 80, 80));
+                g.FillRectangle(tb, tr);
+                using var txb = new SolidBrush(Color.White);
+                g.DrawString(dt, f, txb, _rect.X+4, _rect.Y-(int)ts.Height-2);
 
-                // 5. 手柄（选区固定后显示）
+                // 5. 手柄 + ActionBar
                 if (_dragMode != DragMode.Create)
-                    DrawHandles(g);
-
-                // 6. ActionBar（选区固定后显示）
-                if (_dragMode != DragMode.Create)
-                    DrawActionBar(g);
+                { DrawHandles(g); DrawActionBar(g); }
             }
             else
             {
-                // 全屏半透明遮罩
-                var screenRect = new Rectangle(0, 0, this.ClientSize.Width, this.ClientSize.Height);
-                using var maskBrush = new SolidBrush(Color.FromArgb(60, 0, 0, 0));
-                g.FillRectangle(maskBrush, screenRect);
-
-                // 提示文字
-                using var tipFont = new Font("Segoe UI", 16);
-                using var tipBrush = new SolidBrush(Color.FromArgb(180, 255, 255, 255));
+                var sr = new Rectangle(0, 0, ClientSize.Width, ClientSize.Height);
+                using var mb = new SolidBrush(Color.FromArgb(60, 0, 0, 0)); g.FillRectangle(mb, sr);
+                using var tf = new Font("Segoe UI", 16);
+                using var tp = new SolidBrush(Color.FromArgb(180, 255, 255, 255));
                 var tip = "拖动鼠标选择截图区域";
-                var size = g.MeasureString(tip, tipFont);
-                g.DrawString(tip, tipFont, tipBrush,
-                    (this.ClientSize.Width - size.Width) / 2,
-                    (this.ClientSize.Height - size.Height) / 2);
+                var s = g.MeasureString(tip, tf);
+                g.DrawString(tip, tf, tp, (ClientSize.Width-s.Width)/2, (ClientSize.Height-s.Height)/2);
             }
             base.OnPaint(e);
         }
 
         private void DrawHandles(Graphics g)
         {
-            using var handleBrush = new SolidBrush(Color.FromArgb(255, 255, 80, 80));
-            using var handleBorder = new Pen(Color.White, 1);
-            var handles = GetHandleRects();
-            foreach (var h in handles)
-            {
-                g.FillRectangle(handleBrush, h);
-                g.DrawRectangle(handleBorder, h);
-            }
+            using var hb = new SolidBrush(Color.FromArgb(255, 255, 80, 80));
+            using var hb2 = new Pen(Color.White, 1);
+            foreach (var h in GetHandleRects()) { g.FillRectangle(hb, h); g.DrawRectangle(hb2, h); }
         }
 
         private Rectangle[] GetHandleRects()
         {
-            int s = 8;
-            int h = s / 2;
+            int s = 8, h = s/2;
             return new[]
             {
-                new Rectangle(_rect.Left - h, _rect.Top - h, s, s),
-                new Rectangle(_rect.Right - h, _rect.Top - h, s, s),
-                new Rectangle(_rect.Left - h, _rect.Bottom - h, s, s),
-                new Rectangle(_rect.Right - h, _rect.Bottom - h, s, s),
-                new Rectangle(_rect.Left + _rect.Width/2 - h, _rect.Top - h, s, s),
-                new Rectangle(_rect.Left + _rect.Width/2 - h, _rect.Bottom - h, s, s),
-                new Rectangle(_rect.Left - h, _rect.Top + _rect.Height/2 - h, s, s),
-                new Rectangle(_rect.Right - h, _rect.Top + _rect.Height/2 - h, s, s),
+                new Rectangle(_rect.Left-h, _rect.Top-h, s, s), new Rectangle(_rect.Right-h, _rect.Top-h, s, s),
+                new Rectangle(_rect.Left-h, _rect.Bottom-h, s, s), new Rectangle(_rect.Right-h, _rect.Bottom-h, s, s),
+                new Rectangle(_rect.Left+_rect.Width/2-h, _rect.Top-h, s, s), new Rectangle(_rect.Left+_rect.Width/2-h, _rect.Bottom-h, s, s),
+                new Rectangle(_rect.Left-h, _rect.Top+_rect.Height/2-h, s, s), new Rectangle(_rect.Right-h, _rect.Top+_rect.Height/2-h, s, s),
             };
         }
 
         private void DrawActionBar(Graphics g)
         {
-            var bar = GetActionBarBounds();
-            if (bar.IsEmpty) return;
-
-            // ActionBar 背景
-            using var bgBrush = new SolidBrush(Color.FromArgb(250, 40, 40, 55));
-            using var bgPen = new Pen(Color.FromArgb(200, 80, 80, 100), 1);
-            g.FillRectangle(bgBrush, bar);
-            g.DrawRectangle(bgPen, bar);
-
-            using var hoverBrush = new SolidBrush(Color.FromArgb(255, 70, 130, 180));
+            var bar = GetActionBarBounds(); if (bar.IsEmpty) return;
+            using var bgb = new SolidBrush(Color.FromArgb(250, 40, 40, 55));
+            using var bgp = new Pen(Color.FromArgb(200, 80, 80, 100), 1);
+            g.FillRectangle(bgb, bar); g.DrawRectangle(bgp, bar);
+            using var hb = new SolidBrush(Color.FromArgb(255, 70, 130, 180));
             using var font = new Font("Segoe UI", 10);
-            using var textBrush = new SolidBrush(Color.White);
-
+            using var tb = new SolidBrush(Color.White);
             for (int i = 0; i < _toolLabels.Length; i++)
             {
                 var btn = GetToolButtonRect(i);
-                if (i == _hoverToolIndex)
-                    g.FillRectangle(hoverBrush, btn);
-
-                var size = g.MeasureString(_toolLabels[i], font);
-                g.DrawString(_toolLabels[i], font, textBrush,
-                    btn.X + (btn.Width - size.Width) / 2,
-                    btn.Y + (btn.Height - size.Height) / 2);
+                if (i == _hoverToolIndex) g.FillRectangle(hb, btn);
+                var sz = g.MeasureString(_toolLabels[i], font);
+                g.DrawString(_toolLabels[i], font, tb, btn.X+(btn.Width-sz.Width)/2, btn.Y+(btn.Height-sz.Height)/2);
             }
         }
 
-        // ── 拖拽模式判断 ───────────────────────────────────
+        // ── 拖拽模式判断 ────────────────────────────────────
         private DragMode GetDragModeAt(Point p)
         {
-            if (_rect.Width <= 0 || _rect.Height <= 0)
-                return DragMode.None;
-
-            if (HitTestToolButton(p) >= 0)
-                return DragMode.None;
-
+            if (_rect.Width <= 0 || _rect.Height <= 0) return DragMode.None;
+            if (HitTestToolButton(p) >= 0) return DragMode.None;
             var handles = GetHandleRects();
-            if (handles[0].Contains(p)) return DragMode.ResizeTopLeft;
-            if (handles[1].Contains(p)) return DragMode.ResizeTopRight;
-            if (handles[2].Contains(p)) return DragMode.ResizeBottomLeft;
-            if (handles[3].Contains(p)) return DragMode.ResizeBottomRight;
-            if (handles[4].Contains(p)) return DragMode.ResizeTop;
-            if (handles[5].Contains(p)) return DragMode.ResizeBottom;
-            if (handles[6].Contains(p)) return DragMode.ResizeLeft;
-            if (handles[7].Contains(p)) return DragMode.ResizeRight;
-
-            if (Math.Abs(p.X - _rect.Left) < 6 && p.Y > _rect.Top && p.Y < _rect.Bottom) return DragMode.ResizeLeft;
-            if (Math.Abs(p.X - _rect.Right) < 6 && p.Y > _rect.Top && p.Y < _rect.Bottom) return DragMode.ResizeRight;
-            if (Math.Abs(p.Y - _rect.Top) < 6 && p.X > _rect.Left && p.X < _rect.Right) return DragMode.ResizeTop;
-            if (Math.Abs(p.Y - _rect.Bottom) < 6 && p.X > _rect.Left && p.X < _rect.Right) return DragMode.ResizeBottom;
-
+            if (handles[0].Contains(p)) return DragMode.ResizeTopLeft; if (handles[1].Contains(p)) return DragMode.ResizeTopRight;
+            if (handles[2].Contains(p)) return DragMode.ResizeBottomLeft; if (handles[3].Contains(p)) return DragMode.ResizeBottomRight;
+            if (handles[4].Contains(p)) return DragMode.ResizeTop; if (handles[5].Contains(p)) return DragMode.ResizeBottom;
+            if (handles[6].Contains(p)) return DragMode.ResizeLeft; if (handles[7].Contains(p)) return DragMode.ResizeRight;
+            if (Math.Abs(p.X-_rect.Left)<6 && p.Y>_rect.Top && p.Y<_rect.Bottom) return DragMode.ResizeLeft;
+            if (Math.Abs(p.X-_rect.Right)<6 && p.Y>_rect.Top && p.Y<_rect.Bottom) return DragMode.ResizeRight;
+            if (Math.Abs(p.Y-_rect.Top)<6 && p.X>_rect.Left && p.X<_rect.Right) return DragMode.ResizeTop;
+            if (Math.Abs(p.Y-_rect.Bottom)<6 && p.X>_rect.Left && p.X<_rect.Right) return DragMode.ResizeBottom;
             if (_rect.Contains(p)) return DragMode.Move;
-
             return DragMode.None;
         }
 
         private void UpdateCursor(Point p)
         {
-            var mode = GetDragModeAt(p);
-            this.Cursor = mode switch
+            this.Cursor = GetDragModeAt(p) switch
             {
                 DragMode.Move => Cursors.SizeAll,
                 DragMode.ResizeLeft or DragMode.ResizeRight => Cursors.SizeWE,
@@ -602,27 +567,19 @@ namespace Sinp.Overlay
             };
         }
 
-        private static Rectangle NormalizeRect(Point a, Point b)
-        {
-            return new Rectangle(
-                Math.Min(a.X, b.X),
-                Math.Min(a.Y, b.Y),
-                Math.Abs(a.X - b.X),
-                Math.Abs(a.Y - b.Y)
-            );
-        }
+        private static Rectangle NormalizeRect(Point a, Point b) =>
+            new(Math.Min(a.X,b.X), Math.Min(a.Y,b.Y), Math.Abs(a.X-b.X), Math.Abs(a.Y-b.Y));
 
-        // ── 清理 ───────────────────────────────────────────
+        // =====================================================
+        //  清理
+        // =====================================================
         protected override void Dispose(bool disposing)
         {
             if (disposing)
             {
-                _frozenBackground?.Dispose();
-                _frozenBackground = null;
-                // 清理长截图帧（CapturedImage 由外部负责 Dispose）
-                foreach (var f in _longFrames)
-                    f.Dispose();
-                _longFrames.Clear();
+                StopAutoScroll();
+                _frozenBackground?.Dispose(); _frozenBackground = null;
+                foreach (var f in _longFrames) f.Dispose(); _longFrames.Clear();
             }
             base.Dispose(disposing);
         }

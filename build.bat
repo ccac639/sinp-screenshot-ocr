@@ -7,12 +7,12 @@ echo ========================================
 echo.
 
 echo [0/4] Killing running instances...
-taskkill /f /im Sinp.App.exe 2>nul
-if %errorlevel% neq 0 (
-    echo Cannot kill process. Please close Sinp manually, or run this as Administrator.
-    echo Trying alternative method...
-    powershell -Command "Get-Process Sinp.App -ErrorAction SilentlyContinue | Stop-Process -Force" 2>nul
-)
+:: 强力结束进程（多重保险）
+taskkill /f /im Sinp.App.exe >nul 2>&1
+taskkill /f /im dotnet.exe >nul 2>&1
+powershell -Command "Get-Process -Name 'Sinp.App' -ErrorAction SilentlyContinue | Stop-Process -Force; Get-Process -Name 'dotnet' -ErrorAction SilentlyContinue | Where-Object {$_.Id -ne $PID} | Stop-Process -Force" >nul 2>&1
+:: 等待进程完全结束
+timeout /t 2 >nul
 echo Done.
 echo.
 

@@ -355,16 +355,32 @@ namespace Sinp.App
             var success = await tcs.Task;
             _activeSelector = null;
 
-            if (!success || selector.CapturedImage == null)
+            if (!success)
             {
                 StatusText.Text = "长截图已取消";
                 selector.Dispose();
                 return;
             }
 
-            // 如果是长截图，用所有帧拼接
+            // 长截图：判断结果来源
             Bitmap? resultImage = selector.CapturedImage;
-            if (selector.IsLongScreenshot && selector.LongFrames.Count > 1)
+            bool needStitch = selector.IsLongScreenshot && selector.LongFrames.Count > 1;
+
+            // 如果 CapturedImage 为 null 但有多个帧 → 需要拼接
+            if (resultImage == null && needStitch)
+            {
+                // CapturedImage=null 表示 RegionSelector 把帧留给 MainWindow 拼接
+            }
+            else if (resultImage == null && !needStitch)
+            {
+                // 没有任何图像数据
+                StatusText.Text = "长截图失败：未捕获到图像";
+                selector.Dispose();
+                return;
+            }
+
+            // 拼接长截图帧
+            if (needStitch)
             {
                 StatusText.Text = "正在拼接长截图...";
                 Logger.Info(string.Format("开始拼接 {0} 帧", selector.LongFrames.Count));

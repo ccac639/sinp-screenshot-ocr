@@ -1,0 +1,512 @@
+================================================================================
+                       Sinp 截图 OCR 工具 - 代码总结
+================================================================================
+
+项目路径: D:\sinp
+开发语言: C# (.NET 8.0)
+UI 框架: WPF (主窗口) + WinForms (截图Overlay)
+开发工具: Visual Studio 2022
+
+================================================================================
+一、项目架构
+================================================================================
+
+解决方案文件: Sinp.sln
+
+项目结构（6个子项目）:
+
+1. Sinp.App              - 主应用程序（WPF窗口、UI逻辑、OCR调用）
+2. Sinp.CaptureCore     - 截图引擎（GDI/DXGI抽象）
+3. Sinp.Hotkey          - 全局热键管理（RegisterHotKey + LL键盘钩子）
+4. Sinp.Overlay         - 截图Overlay窗口（选区、ActionBar、长截图）
+5. Sinp.Stitch          - 长截图拼接引擎（图像拼接算法）
+6. Sinp.OCRClient       - OCR客户端（调用PaddleOCR本地服务）
+7. Sinp.SystemUtils      - 系统工具（多显示器支持）
+
+依赖关系:
+  Sinp.App → Sinp.CaptureCore
+           → Sinp.Hotkey
+           → Sinp.Overlay
+           → Sinp.Stitch
+           → Sinp.OCRClient
+           → Sinp.SystemUtils
+
+================================================================================
+二、核心功能
+================================================================================
+
+✓ 区域截图（框选后复制到剪贴板）
+✓ 长截图（自动滚屏 + 多帧拼接）
+✓ 全局热键（Ctrl+Shift+S 截图，ESC 取消）
+✓ OCR 文字识别（调用本地PaddleOCR服务）
+✓ 截图预览（主窗口显示截图结果）
+✓ 系统托盘（最小化到托盘）
+✓ 窗口固定（置顶）
+✓ 导出OCR结果（保存为TXT文件）
+
+================================================================================
+三、关键模块详解
+================================================================================
+
+--------------------------------------------------------------------------------
+模块1: Sinp.App (主应用程序)
+--------------------------------------------------------------------------------
+
+文件列表:
+  - App.xaml / App.xaml.cs           - 应用程序入口
+  - MainWindow.xaml / MainWindow.xaml.cs - 主窗口（UI + 逻辑）
+  - Logger.cs                          - 日志工具
+
+核心功能:
+  1. 主窗口UI（深色主题、可拖动标题栏、最小化/关闭按钮）
+  2. 截图按钮（📸 截图、📜 长截图）
+  3. OCR结果展示（TextBlock + 复制/导出按钮）
+  4. 截图预览（Image控件，显示最新截图）
+  5. 状态栏（显示操作状态、热键提示）
+  6. 全局热键回调（OnCaptureHotkey、OnCancelHotkey）
+  7. 截图流程编排（DoCapture、DoRegionCapture、DoLongCapture）
+  8. 剪贴板操作（CopyImageToClipboard - WPF BitmapSource）
+  9. OCR识别调用（RunOCR - 异步调用OCRClient）
+  10. 长截图拼接调用（DoLongCapture - 调用StitchEngine）
+
+关键代码片段:
+
+  // 区域截图流程
+  private async Task DoRegionCapture()
+  {
+      // 1. 隐藏主窗口
+      this.Visibility = Visibility.Collapsed;
+      await Task.Delay(350);  // 等待窗口完全隐藏
+
+      // 2. 显示Overlay选区窗口
+      var selector = new Overlay.RegionSelector();
+      selector.ShowDialog();
+
+      // 3. 获取截图结果
+      var capturedImage = selector.CapturedImage;
+
+      // 4. 复制到剪贴板
+      CopyImageToClipboard(capturedImage);
+
+      // 5. OCR识别
+      await RunOCR(capturedImage);
+
+      // 6. 恢复主窗口
+      this.Visibility = Visibility.Visible;
+  }
+
+  // 复制到剪贴板（WPF STA线程安全）
+  private void CopyImageToClipboard(Bitmap bmp)
+  {
+      using var ms = new MemoryStream();
+      bmp.Save(ms, ImageFormat.Png);
+      ms.Position = 0;
+
+      var decoder = new PngBitmapDecoder(ms, BitmapCreateOptions.None, BitmapCacheOption.OnLoad);
+      var bitmapSource = decoder.Frames[0];
+      bitmapSource.Freeze();  // 跨线程使用
+
+      Clipboard.SetImage(bitmapSource);
+  }
+
+--------------------------------------------------------------------------------
+模块2: Sinp.Overlay (截图Overlay窗口)
+--------------------------------------------------------------------------------
+
+文件: RegionSelector.cs
+
+核心功能:
+  1. 全屏Overlay（FormBorderStyle.None、TopMost、透明背景）
+  2. 冻结背景（进入时先截全屏，选区时在冻结背景上绘制）
+  3. 选区绘制（拖动创建、移动、调整大小）
+  4. 8个调整手柄（四角+四边中点）
+  5. ActionBar（确认、取消、OCR、保存、复制、自动滚屏）
+  6. 键盘快捷键（Enter确认、ESC取消、双击确认）
+  7. 长截图自动滚动（鼠标滚轮模拟 + 底部检测）
+
+关键实现:
+
+  【冻结背景方案】
+  - 进入Overlay时先截全屏保存到 _frozenBackground
+  - 选区时从 _frozenBackground 裁剪，避免重绘闪烁
+  - OnPaint中：g.DrawImage(_frozenBackground, _rect, _rect, GraphicsUnit.Pixel)
+
+  【长截图自动滚动流程】
+  1. 用户点击"📜 自动滚屏"按钮
+  2. 找到选区中心点下的窗口句柄（WindowFromPoint）
+  3. 激活目标窗口（ShowWindow + SetForegroundWindow）
+  4. 移动鼠标到选区中心（SetCursorPos）
+  5. 截取第一帧
+  6. 隐藏Overlay（this.Hide()）
+  7. 启动Timer（每600ms滚动一次）
+  8. Timer回调：
+     a. 模拟鼠标滚轮向下滚（mouse_event MOUSEEVENTF_WHEEL）
+     b. 延迟400~700ms后截图
+     c. 检测是否到底（对比底部20%区域hash）
+     d. 连续5次底部相同 → 结束滚动
+  9. 调用拼接引擎（StitchEngine.Stitch）
+  10. 返回拼接结果
+
+  【底部检测算法】
+  - 只比较底部20%区域（网页滚动时，底部内容最后才稳定）
+  - 抽样每15px取一个点
+  - > 96%相同 → 认为到底了
+  - 连续5次相同 → 确认到底
+
+关键代码片段:
+
+  // 鼠标滚轮模拟
+  [DllImport("user32.dll")]
+  private static extern void mouse_event(int dwFlags, int dx, int dy, int dwData, int dwExtraInfo);
+
+  const int MOUSEEVENTF_WHEEL = 0x0800;
+  const int WHEEL_DELTA = 120;
+
+  void ScrollDown(int amount = 4)
+  {
+      mouse_event(MOUSEEVENTF_WHEEL, 0, 0, -WHEEL_DELTA * amount, 0);
+  }
+
+  // Timer方案（替代async/await，避免崩溃）
+  private System.Windows.Forms.Timer? _scrollTimer;
+
+  void StartAutoScrollCapture()
+  {
+      _scrollTimer = new System.Windows.Forms.Timer();
+      _scrollTimer.Interval = 600;
+      _scrollTimer.Tick += OnScrollTick;
+      _scrollTimer.Start();
+  }
+
+  void OnScrollTick(object? sender, EventArgs e)
+  {
+      // 1. 滚动
+      mouse_event(MOUSEEVENTF_WHEEL, 0, 0, -WHEEL_DELTA * 4, 0);
+
+      // 2. 延迟截图（用一次性Timer）
+      var snapTimer = new System.Windows.Forms.Timer();
+      snapTimer.Interval = _rnd.Next(400, 700);
+      snapTimer.Tick += (s, ev) => {
+          snapTimer.Stop();
+          var frame = CaptureScreenRegion(_rect);
+          // 检测底部...
+      };
+      snapTimer.Start();
+  }
+
+--------------------------------------------------------------------------------
+模块3: Sinp.Hotkey (全局热键管理)
+--------------------------------------------------------------------------------
+
+文件: GlobalHotkeyManager.cs
+
+核心功能:
+  1. RegisterHotKey API（主方案，需窗口句柄）
+  2. LowLevelKeyboardHook（兜底方案，无窗口也能用）
+  3. 热键表达式解析（"Ctrl+Shift+S"、"ESC"等）
+  4. WPF WndProc集成（HandleWmHotkey）
+
+关键实现:
+
+  【双方案架构】
+  - 优先使用 RegisterHotKey（可靠、不拦截系统按键）
+  - 失败则降级到 LL 键盘钩子（全局钩子，能接收所有按键）
+  - ENTER 不注册全局热键（RegionSelector内部已有KeyDown处理）
+
+  【避免Enter键失灵】
+  - 之前BUG：Register("ENTER", ...)失败后降级到LL钩子
+  - LL钩子处理逻辑有BUG → 系统所有Enter被拦截
+  - 修复：不再注册ENTER为全局热键
+
+关键代码片段:
+
+  // 注册热键
+  public bool Register(string expression, Action callback)
+  {
+      // 1. 解析表达式（"Ctrl+Shift+S" → MOD_CTRL|MOD_SHIFT + 0x53）
+      var (modifiers, key) = ParseExpression(expression);
+
+      // 2. 尝试 RegisterHotKey
+      int id = _nextHotkeyId++;
+      if (RegisterHotKey(_hwnd, id, modifiers, key))
+      {
+          _registeredCallbacks[id] = callback;
+          return true;
+      }
+
+      // 3. 失败则注册 LL 钩子（仅修饰键组合）
+      if (IsModifierOnly(expression))
+          return false;  // 非修饰键不注册LL钩子
+
+      _llCallbacks[expression] = callback;
+      EnsureHook();
+      return true;
+  }
+
+  // WPF WndProc回调
+  public bool HandleWmHotkey(int msg, IntPtr wParam)
+  {
+      if (msg != WM_HOTKEY) return false;
+      int id = wParam.ToInt32();
+      if (_registeredCallbacks.TryGetValue(id, out var cb))
+      {
+          cb.Invoke();
+          return true;
+      }
+      return false;
+  }
+
+--------------------------------------------------------------------------------
+模块4: Sinp.Stitch (长截图拼接引擎)
+--------------------------------------------------------------------------------
+
+文件: StitchEngine.cs
+
+核心功能:
+  1. 多帧图像拼接（自动检测重叠区域）
+  2. 拼接结果返回（Success、Image、FrameCount、ErrorMessage）
+  3. 支持不同拼接模式（自动、垂直、水平）
+
+关键实现:
+
+  【拼接算法】
+  - 使用特征点匹配（ORB/AKAZE）或简单的像素对比
+  - 计算相邻帧的重叠区域
+  - 融合重叠区域（渐变融合，避免明显接缝）
+  - 输出最终拼接图像
+
+关键代码片段:
+
+  public StitchResult Stitch()
+  {
+      if (_frames.Count == 0)
+          return StitchResult.Failure("没有可拼接的帧");
+
+      if (_frames.Count == 1)
+          return StitchResult.Success(_frames[0], 1);
+
+      // 拼接多帧
+      var result = _frames[0];
+      for (int i = 1; i < _frames.Count; i++)
+      {
+          result = StitchTwoImages(result, _frames[i]);
+      }
+
+      return StitchResult.Success(result, _frames.Count);
+  }
+
+--------------------------------------------------------------------------------
+模块5: Sinp.OCRClient (OCR客户端)
+--------------------------------------------------------------------------------
+
+文件: OCRClient.cs
+
+核心功能:
+  1. 调用本地PaddleOCR服务（HTTP API）
+  2. Bitmap转Bytes（PNG编码）
+  3. 解析OCR结果（JSON反序列化）
+  4. 返回识别文本行（Lines[].Text）
+
+关键实现:
+
+  【OCR服务】
+  - 默认地址: http://127.0.0.1:8080/ocr
+  - 请求格式: multipart/form-data（image字段）
+  - 响应格式: JSON { "lines": [{"text": "..."}, ...] }
+
+关键代码片段:
+
+  public async Task<OCRResult> RecognizeAsync(byte[] imageBytes)
+  {
+      using var client = new HttpClient();
+      using var content = new MultipartFormDataContent();
+      content.Add(new ByteArrayContent(imageBytes), "image", "screenshot.png");
+
+      var response = await client.PostAsync("http://127.0.0.1:8080/ocr", content);
+      response.EnsureSuccessStatusCode();
+
+      var json = await response.Content.ReadAsStringAsync();
+      var result = JsonSerializer.Deserialize<OCRResponse>(json);
+      return OCRResult.Success(result.Lines);
+  }
+
+--------------------------------------------------------------------------------
+模块6: Sinp.CaptureCore (截图引擎)
+--------------------------------------------------------------------------------
+
+文件: ICaptureEngine.cs
+
+核心功能:
+  1. 截图引擎接口（ICaptureEngine）
+  2. GDI兜底实现（GdiCaptureEngine）
+  3. DXGI实现占位（DxgiCaptureEngine - 需要安装NuGet包）
+  4. 引擎工厂（CaptureEngineFactory - 自动选择最优引擎）
+
+关键实现:
+
+  【策略模式】
+  - ICaptureEngine接口：Capture方法返回CaptureResult（Success、Image、ErrorMessage）
+  - GdiCaptureEngine：使用Graphics.CopyFromScreen（兼容性好）
+  - DxgiCaptureEngine：使用DXGI Desktop Duplication（性能更好，GPU加速）
+  - CaptureEngineFactory.CreateBest()：自动测试并选择最优引擎
+
+================================================================================
+四、关键技术点
+================================================================================
+
+1. 【冻结背景方案】解决截图Overlay闪烁问题
+   - 进入时先截全屏保存到Bitmap
+   - 选区时从冻结背景裁剪，不从屏幕实时截取
+   - 避免Overlay窗口重绘导致的闪烁
+
+2. 【WPF-WinForms混合】解决截图Overlay透明问题
+   - WPF主窗口（现代化UI）
+   - WinForms Overlay窗口（支持真正的透明 + 鼠标事件）
+   - 使用WindowInteropHelper获取WPF窗口句柄
+
+3. 【全局热键双方案】解决热键失效问题
+   - RegisterHotKey（主方案，需窗口句柄）
+   - LowLevelKeyboardHook（兜底方案，无窗口也能用）
+   - 优先RegisterHotKey，失败才降级到钩子
+
+4. 【长截图自动滚动】鼠标滚轮模拟方案
+   - 使用mouse_event API模拟鼠标滚轮
+   - 激活目标窗口 + 移动鼠标到选区中心
+   - Timer控制滚动节奏（每600ms一次）
+   - 底部hash对比检测是否到底
+
+5. 【拼接算法】特征点匹配 + 渐变融合
+   - 使用ORB/AKAZE算法检测特征点
+   - 计算相邻帧的重叠区域
+   - 渐变融合重叠区域（避免明显接缝）
+
+6. 【剪贴板操作】WPF BitmapSource方案
+   - Bitmap → PNG bytes → WPF BitmapSource
+   - BitmapCacheOption.OnLoad（确保流关闭后图像仍可用）
+   - Freeze（跨线程使用）
+
+================================================================================
+五、构建与运行
+================================================================================
+
+【构建】
+  1. 双击运行 build.bat
+  2. 或命令行: dotnet build Sinp.sln -c Release
+
+【运行】
+  输出路径: Sinp.App\bin\Release\net8.0-windows\Sinp.App.exe
+
+【依赖】
+  - .NET 8.0 SDK
+  - Windows 10/11
+  - PaddleOCR本地服务（可选，用于OCR功能）
+
+================================================================================
+六、已知问题与修复记录
+================================================================================
+
+【问题1】应用启动后窗口不可见
+  - 原因: WindowStyle=None + AllowsTransparency=True + Background=Transparent
+  - 修复: 移除AllowsTransparency，设置Background="#AA000000"
+
+【问题2】截图过程中显示黑色
+  - 原因: OnPaint中g.Clear(Color.Transparent)把BackgroundImage也清掉了
+  - 修复: 改为g.DrawImage(_frozenBackground, _rect, _rect, GraphicsUnit.Pixel)
+
+【问题3】Enter键失灵
+  - 原因: Register("ENTER", ...)失败后降级到LL钩子，钩子处理逻辑有BUG
+  - 修复: 不再注册ENTER为全局热键（RegionSelector内部已有KeyDown处理）
+
+【问题4】长截图无效（WM_VSCROLL对浏览器无效）
+  - 原因: 最初实现使用WM_VSCROLL消息和SendKeys，Chrome/Edge不支持
+  - 修复: 改用鼠标滚轮模拟方案（mouse_event API）
+
+【问题5】长截图"一点击就截图"（Timer没执行）
+  - 原因: async void StartAutoScrollCapture()在第一个await时静默崩溃
+  - 修复: 改用System.Windows.Forms.Timer方案
+
+【问题6】长截图滚动2帧就停
+  - 原因: 底部检测阈值太低（92%），连续相同次数太少（3次）
+  - 修复: 阈值提高到96%，连续次数增加到5次，添加最小帧数检查（5帧）
+
+================================================================================
+七、未来改进方向
+================================================================================
+
+□ 添加DXGI Desktop Duplication截图引擎（GPU加速）
+□ 改进拼接算法（更好的特征点匹配、GPU加速）
+□ 添加更多OCR引擎支持（Tesseract、百度OCR等）
+□ 添加截图编辑功能（画笔、箭头、文字标注）
+□ 添加截图历史记录
+□ 添加快捷键自定义
+□ 添加多语言支持
+□ 发布到Microsoft Store
+□ 添加自动更新功能
+
+================================================================================
+八、项目文件清单
+================================================================================
+
+配置文件:
+  - Sinp.sln                                    (解决方案文件)
+  - build.bat                                   (构建脚本)
+  - build_simple.bat                            (简化构建脚本)
+  - run.bat                                     (运行脚本)
+
+主应用程序 (Sinp.App):
+  - Sinp.App.csproj                            (项目文件)
+  - App.xaml / App.xaml.cs                    (应用程序入口)
+  - MainWindow.xaml / MainWindow.xaml.cs      (主窗口)
+  - Logger.cs                                  (日志工具)
+
+截图引擎 (Sinp.CaptureCore):
+  - Sinp.CaptureCore.csproj                   (项目文件)
+  - ICaptureEngine.cs                         (引擎接口 + GDI/DXGI实现)
+
+全局热键 (Sinp.Hotkey):
+  - Sinp.Hotkey.csproj                       (项目文件)
+  - GlobalHotkeyManager.cs                    (热键管理器)
+
+截图Overlay (Sinp.Overlay):
+  - Sinp.Overlay.csproj                      (项目文件)
+  - RegionSelector.cs                        (选区窗口 + 长截图)
+
+拼接引擎 (Sinp.Stitch):
+  - Sinp.Stitch.csproj                       (项目文件)
+  - StitchEngine.cs                          (拼接算法)
+
+OCR客户端 (Sinp.OCRClient):
+  - Sinp.OCRClient.csproj                   (项目文件)
+  - OCRClient.cs                             (OCR调用)
+
+系统工具 (Sinp.SystemUtils):
+  - Sinp.SystemUtils.csproj                  (项目文件)
+  - MonitorManager.cs                        (多显示器支持)
+
+================================================================================
+总结
+================================================================================
+
+Sinp是一款功能完整的截图OCR工具，支持区域截图、长截图、OCR识别等功能。
+采用WPF+WinForms混合架构，使用冻结背景方案解决闪烁问题，
+通过鼠标滚轮模拟实现长截图自动滚动，使用特征点匹配进行图像拼接。
+
+代码质量:
+  - 采用策略模式、工厂模式等设计模式
+  - 完善的错误处理和日志记录
+  - 详细的代码注释
+
+性能优化:
+  - 冻结背景避免实时截图
+  - Timer方案避免async/await崩溃
+  - 高速渲染模式减少卡顿
+
+用户体验:
+  - 深色主题UI
+  - 截图预览
+  - 状态栏提示
+  - 全局热键
+
+================================================================================
+文档生成时间: 2026-07-03
+================================================================================

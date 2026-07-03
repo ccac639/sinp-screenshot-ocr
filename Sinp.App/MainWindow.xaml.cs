@@ -352,8 +352,18 @@ namespace Sinp.App
                 }
                 else
                 {
-                    StatusText.Text = string.Format("OCR 失败: {0}", resp.ErrorMessage);
-                    Logger.Error(string.Format("OCR 失败: {0}", resp.ErrorMessage));
+                    // 显示更友好的错误信息
+                    var errorMsg = resp.ErrorMessage ?? "未知错误";
+                    if (errorMsg.Contains("Worker 未运行"))
+                    {
+                        StatusText.Text = "OCR Worker 未启动，请检查 Python 环境";
+                        Logger.Error("OCR 失败: Python Worker 未运行");
+                    }
+                    else
+                    {
+                        StatusText.Text = string.Format("OCR 失败: {0}", errorMsg);
+                        Logger.Error(string.Format("OCR 失败: {0}", errorMsg));
+                    }
                 }
             }
             catch (Exception ex)

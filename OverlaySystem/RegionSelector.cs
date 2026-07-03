@@ -43,15 +43,22 @@ namespace Sinp.Overlay
         private Rectangle _rectBefore;
 
         // ActionBar
-        private readonly string[] _toolLabels = { "✓ 确认", "✗ 取消", "🔍 OCR", "💾 保存", "📋 复制" };
+        private readonly string[] _toolLabels = { "✓ 确认", "✗ 取消", "🔍 OCR", "💾 保存", "📋 复制", "📜 长截图" };
         private int _hoverToolIndex = -1;
         private const int TOOL_BTN_HEIGHT = 36;
-        private const int TOOL_BTN_WIDTH = 72;
+        private const int TOOL_BTN_WIDTH = 78;
+
+        // 长截图模式
+        private bool _longScreenshotMode = false;
+        private readonly List<Bitmap> _longFrames = new();
+        public IReadOnlyList<Bitmap> LongFrames => _longFrames.AsReadOnly();
+        public bool IsLongScreenshot { get; private set; } = false;
 
         // 结果
         public Rectangle? SelectedRegion { get; private set; }
         public event Action<Rectangle>? OnRegionSelected;
         public event Action? OnCancelled;
+        public event Action<string>? OnStatusMessage;  // 长截图状态提示
 
         /// <summary>
         /// 程序化触发确认（供外部调用，如 Enter 热键）
@@ -102,9 +109,21 @@ namespace Sinp.Overlay
             this.KeyDown += (s, e) =>
             {
                 if (e.KeyCode == Keys.Enter || e.KeyCode == Keys.Return)
-                    ConfirmSelection();
+                {
+                    if (_longScreenshotMode)
+                        ConfirmLongScreenshot();
+                    else
+                        ConfirmSelection();
+                }
                 else if (e.KeyCode == Keys.Escape)
+                {
                     Cancel();
+                }
+                else if (e.KeyCode == Keys.Space && _longScreenshotMode)
+                {
+                    // 空格键：捕获当前视口帧
+                    CaptureLongFrame();
+                }
             };
         }
 
@@ -250,7 +269,69 @@ namespace Sinp.Overlay
             base.OnMouseDoubleClick(e);
         }
 
-        // ── 确认 / 取消 ────────────────────────────────────
+        // ── 长截图：捕获当前视口帧 ─────────────────────
+        private void CaptureLongFrame()
+        {
+            if (_rect.Width <= 5 || _rect.Height <= 5 || _frozenBackground == null)
+                return;
+
+            // 从冻结背景裁剪当前选区
+            var frame = new Bitmap(_rect.Width, _rect.Height);
+            using (var g = Graphics.FromImage(frame))
+            {
+                g.DrawImage(_frozenBackground,
+                    new Rectangle(0, 0, _rect.Width, _rect.Height),
+                    _rect, GraphicsUnit.Pixel);
+            }
+            _longFrames.Add(frame);
+
+            // 更新按钮文字：显示已捕获帧数
+            _toolLabels[5] = $"📜 {_longFrames.Count} 帧（空格继续）";
+            _toolLabels[0] = $"✓ 完成（{_longFrames.Count}帧）";
+            this.Invalidate();
+
+            OnStatusMessage?.Invoke($"长截图：已捕获 {_longFrames.Count} 帧，滚动后按空格继续");
+
+            // 重新截屏以捕获滚动后的新内容
+            CaptureFrozenBackground();
+        }
+
+        // ── 长截图：完成拼接 ─────────────────────────────
+        private void ConfirmLongScreenshot()
+        {
+            if (_longFrames.Count == 0)
+            {
+                ConfirmSelection();
+                return;
+            }
+
+            try
+            {
+                // 拼接由 MainWindow 负责，这里只标记完成
+                // （RegionSelector 不引用 StitchEngine，避免循环依赖）
+                IsLongScreenshot = true;
+                // CapturedImage 用最后一帧占位，MainWindow 会用全部帧重新拼接
+                if (_longFrames.Count > 0)
+                    CapturedImage = (Bitmap)_longFrames.Last().Clone();
+                SelectedRegion = _rect;
+                OnRegionSelected?.Invoke(_rect);
+                this.Close();
+            }
+            catch (Exception ex)
+            {
+                OnStatusMessage?.Invoke($"长截图拼接失败：{ex.Message}");
+            }
+
+            // 拼接失败，用最后一帧作为结果
+            if (_longFrames.Count > 0)
+            {
+                CapturedImage = _longFrames.Last();
+                IsLongScreenshot = true;
+                SelectedRegion = _rect;
+                OnRegionSelected?.Invoke(_rect);
+            }
+            this.Close();
+        }
         private void ConfirmSelection()
         {
             if (_rect.Width > 5 && _rect.Height > 5 && _frozenBackground != null)
@@ -319,15 +400,45 @@ namespace Sinp.Overlay
         {
             switch (index)
             {
-                case 0: ConfirmSelection(); break;
-                case 1: Cancel(); break;
-                case 2:
-                case 3:
-                case 4:
-                    // 复用 ConfirmSelection 的裁剪逻辑
+                case 0: // 确认
+                    if (_longScreenshotMode)
+                        ConfirmLongScreenshot();
+                    else
+                        ConfirmSelection();
+                    break;
+                case 1: // 取消
+                    Cancel();
+                    break;
+                case 5: // 📜 长截图
+                    EnterLongScreenshotMode();
+                    break;
+                default:
+                    // OCR / 保存 / 复制 → 先确认选区，再执行
                     ConfirmSelection();
                     break;
             }
+        }
+
+        /// <summary>
+        /// 进入长截图模式：捕获第一帧，等待用户滚动后按空格捕获更多帧
+        /// </summary>
+        private void EnterLongScreenshotMode()
+        {
+            if (_rect.Width <= 5 || _rect.Height <= 5)
+                return;
+
+            _longScreenshotMode = true;
+
+            // 捕获第一帧
+            CaptureLongFrame();
+
+            // 更新按钮文字：显示已捕获帧数 + 操作提示
+            _toolLabels[5] = $"📜 {_longFrames.Count} 帧（空格继续）";
+            // 替换确认按钮文字
+            _toolLabels[0] = $"✓ 完成（{_longFrames.Count}帧）";
+            this.Invalidate();
+
+            OnStatusMessage?.Invoke($"长截图模式：已捕获 1 帧，滚动页面后按空格捕获下一帧，Enter 完成");
         }
 
         // ── 绘制（核心：在冻结背景上画遮罩 + 选区）──────────
@@ -338,15 +449,15 @@ namespace Sinp.Overlay
 
             if (_rect.Width > 0 && _rect.Height > 0)
             {
-                // 1. 选区外画半透明黑色遮罩（盖住冻结背景）
+                // 1. 先画全屏半透明遮罩
                 var screenRect = new Rectangle(0, 0, this.ClientSize.Width, this.ClientSize.Height);
                 using var maskBrush = new SolidBrush(Color.FromArgb(120, 0, 0, 0));
                 g.FillRectangle(maskBrush, screenRect);
 
-                // 2. 选区内清除遮罩（露出冻结背景 = 截图）
-                g.SetClip(_rect);
-                g.Clear(Color.Transparent);
-                g.ResetClip();
+                // 2. 关键修复：选区内部重绘冻结背景（不是 Clear Transparent！）
+                // Clear 会把 BackgroundImage 也擦掉导致黑色
+                // 正确做法：从 _frozenBackground 把选区部分画回来
+                g.DrawImage(_frozenBackground, _rect, _rect, GraphicsUnit.Pixel);
 
                 // 3. 选区边框
                 using var outerPen = new Pen(Color.FromArgb(255, 30, 30, 30), 3);
@@ -508,6 +619,10 @@ namespace Sinp.Overlay
             {
                 _frozenBackground?.Dispose();
                 _frozenBackground = null;
+                // 清理长截图帧（CapturedImage 由外部负责 Dispose）
+                foreach (var f in _longFrames)
+                    f.Dispose();
+                _longFrames.Clear();
             }
             base.Dispose(disposing);
         }

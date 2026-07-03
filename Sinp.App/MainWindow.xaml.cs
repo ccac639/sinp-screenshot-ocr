@@ -43,9 +43,12 @@ namespace Sinp.App
             _hotkeyMgr = new GlobalHotkeyManager(hwnd);
             _hotkeyMgr.OnHotkeyTriggered += msg => Logger.Info(msg);
 
+            // ESC 用全局热键，确保在截图模式下一定能取消
+            // ENTER 不注册全局热键 —— RegionSelector 内部已处理 KeyDown(Enter)
+            // 全局 LL 钩子会拦截系统所有按键，导致 ENTER 在其他窗口失灵
             bool ok1 = _hotkeyMgr.Register("Ctrl+Shift+S", OnCaptureHotkey);
             bool ok2 = _hotkeyMgr.Register("ESC", OnCancelHotkey);
-            bool ok3 = _hotkeyMgr.Register("ENTER", ConfirmSelection);
+            bool ok3 = false; // ENTER 不注册全局热键
 
             Logger.Info(string.Format("Hotkey: Ctrl+Shift+S={0}, ESC={1}, ENTER={2}",
                 ok1 ? "OK" : "FAIL", ok2 ? "OK" : "FAIL", ok3 ? "OK" : "FAIL"));
@@ -319,8 +322,95 @@ namespace Sinp.App
 
         private async Task DoLongCapture()
         {
-            StatusText.Text = "长截图模式（开发中）";
-            await Task.CompletedTask;
+            StatusText.Text = "长截图模式：请在屏幕上拖动选择要捕获的区域...";
+            Logger.Info("进入长截图模式");
+
+            var tcs = new TaskCompletionSource<bool>();
+
+            var selector = new Overlay.RegionSelector();
+            _activeSelector = selector;
+
+            // 状态提示转发
+            selector.OnStatusMessage += msg =>
+            {
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    StatusText.Text = msg;
+                }));
+            };
+
+            selector.OnRegionSelected += rect =>
+            {
+                Logger.Info(string.Format("长截图选区确定: {0}, 帧数: {1}", rect, selector.LongFrames.Count));
+                tcs.TrySetResult(true);
+            };
+            selector.OnCancelled += () =>
+            {
+                Logger.Info("长截图取消");
+                tcs.TrySetResult(false);
+            };
+
+            selector.ShowDialog();
+
+            var success = await tcs.Task;
+            _activeSelector = null;
+
+            if (!success || selector.CapturedImage == null)
+            {
+                StatusText.Text = "长截图已取消";
+                selector.Dispose();
+                return;
+            }
+
+            // 如果是长截图，用所有帧拼接
+            Bitmap? resultImage = selector.CapturedImage;
+            if (selector.IsLongScreenshot && selector.LongFrames.Count > 1)
+            {
+                StatusText.Text = "正在拼接长截图...";
+                Logger.Info(string.Format("开始拼接 {0} 帧", selector.LongFrames.Count));
+                try
+                {
+                    using var stitcher = new Sinp.Stitch.StitchEngine();
+                    foreach (var frame in selector.LongFrames)
+                        stitcher.AddFrame(frame);
+
+                    var stitchResult = stitcher.Stitch();
+                    if (stitchResult.Success && stitchResult.Image != null)
+                    {
+                        resultImage = stitchResult.Image;
+                        Logger.Info(string.Format("拼接完成：{0} 帧 → {1}x{2}",
+                            stitchResult.FrameCount, resultImage.Width, resultImage.Height));
+                    }
+                    else
+                    {
+                        Logger.Error(string.Format("拼接失败: {0}", stitchResult.ErrorMessage));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error("长截图拼接异常", ex);
+                }
+            }
+
+            selector.Dispose();
+
+            if (resultImage == null)
+            {
+                StatusText.Text = "长截图失败";
+                return;
+            }
+
+            // 复制到剪贴板
+            Dispatcher.Invoke(() =>
+            {
+                CopyImageToClipboard(resultImage);
+            });
+
+            StatusText.Text = string.Format("长截图已复制（{0} 帧拼接）", selector.LongFrames.Count);
+            Logger.Info("长截图已复制到剪贴板");
+
+            // 对拼接结果做 OCR
+            await RunOCR(resultImage);
         }
 
         // ── 复制截图到剪贴板（WPF STA 线程）─────────────────
